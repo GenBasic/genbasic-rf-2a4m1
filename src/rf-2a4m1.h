@@ -32,12 +32,13 @@ enum rf_2a4m1_state {
 
 struct rf_2a4m1_dev {
 	struct usb_device	*udev;
-	struct ieee80211_hw	*hw;		/* SoftMAC: MAC in the host driver */
+	struct wiphy		*wiphy;		/* cfg80211 FullMAC: the module's own MAC */
+	struct net_device	*ndev;
 	struct device		*dev;
 	enum rf_2a4m1_state	state;
 	struct mutex		lock;
 	struct workqueue_struct	*wq;
-	/* USB HAL, host-core, and cfg80211 members are added by the modules that
+	/* USB HAL, MAC core, and cfg80211 members are added by the modules that
 	 * own them (src/usb.c, src/core/, src/cfg80211.c). */
 };
 
