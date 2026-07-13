@@ -1,0 +1,12 @@
+# Optional mixed-host rule (NOT installed by default).
+#
+# For a host that must also keep other devices in the shared USB ID range
+# working, use a targeted driver_override instead of the global blacklist in
+# modprobe.d/. This redirects ONLY the RF-2A4M1's USB ID to rf_2a4m1 and leaves
+# the generic in-kernel driver free to bind everything else.
+#
+# Replace VID/PID below with the adapter's provisioned USB ID before use.
+
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", \
+  ATTRS{idVendor}=="0e8d", ATTRS{idProduct}=="7601", \
+  RUN+="/bin/sh -c 'echo rf_2a4m1 > /sys%p/driver_override; echo %k > /sys/bus/usb/drivers_probe'"

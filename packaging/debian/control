@@ -1,0 +1,25 @@
+Source: rf-2a4m1-dkms
+Section: kernel
+Priority: optional
+Maintainer: GenBasic <engineering@genbasic.com>
+Build-Depends: debhelper-compat (= 13), dkms
+Standards-Version: 4.6.2
+Homepage: https://github.com/GenBasic/genbasic-rf-2a4m1
+
+Package: rf-2a4m1-dkms
+Architecture: all
+Depends: dkms (>= 2.1.0.0), ${misc:Depends}
+Recommends: rf-2a4m1-firmware
+Description: GenBasic RF-2A4M1 USB Wi-Fi driver (DKMS, GPL source)
+ Fully-GPL cfg80211 kernel module for the GenBasic RF-2A4M1 single-band
+ 2.4 GHz (1T1R) 802.11b/g/n USB Wi-Fi adapter. Compiled from source by DKMS
+ against the running and installed kernels, so it rebuilds automatically on
+ kernel upgrade. Architecture-independent (no prebuilt object).
+
+Package: rf-2a4m1-firmware
+Architecture: all
+Depends: ${misc:Depends}
+Description: GenBasic RF-2A4M1 on-chip firmware image
+ The on-chip firmware image (rf-2a4m1.bin) for the GenBasic RF-2A4M1 adapter,
+ plus the driver-binding integration (modprobe/udev). Loaded at runtime by the
+ rf-2a4m1 driver. Proprietary; see LICENSE.firmware.

@@ -1,0 +1,8 @@
+PACKAGE_NAME="rf-2a4m1"
+PACKAGE_VERSION="#MODULE_VERSION#"
+CLEAN="make -C ${kernel_source_dir} M=${dkms_tree}/${PACKAGE_NAME}/${PACKAGE_VERSION}/build clean"
+MAKE[0]="make -j$(nproc) KVER=${kernelver} -C ${kernel_source_dir} M=${dkms_tree}/${PACKAGE_NAME}/${PACKAGE_VERSION}/build modules"
+BUILT_MODULE_NAME[0]="rf-2a4m1"
+DEST_MODULE_LOCATION[0]="/updates/dkms"
+AUTOINSTALL="yes"
+BUILD_EXCLUSIVE_KERNEL="^(4\.1[5-9]|4\.[2-9][0-9]|[5-9]\.|[1-9][0-9]\.)"

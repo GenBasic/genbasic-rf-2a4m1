@@ -1,0 +1,33 @@
+RF-2A4M1 firmware image (rf-2a4m1.bin) — License
+
+Copyright © GenBasic. All rights reserved.
+
+The file firmware/rf-2a4m1.bin is the on-chip firmware image executed by the
+RF-2A4M1 adapter's microcontroller. It is proprietary to GenBasic and is
+provided under the following terms.
+
+1. Grant. GenBasic grants you a non-exclusive, non-transferable license to
+   use, load, and redistribute rf-2a4m1.bin solely as firmware for GenBasic
+   RF-2A4M1 hardware, in unmodified form, including as part of an operating-
+   system firmware collection.
+
+2. Restrictions. You may not modify, reverse engineer, decompile, or
+   disassemble rf-2a4m1.bin, except to the extent that applicable law
+   expressly permits despite this limitation.
+
+3. No other rights. The firmware is licensed, not sold. GenBasic retains all
+   rights not expressly granted. This license does not grant any rights to
+   GenBasic trademarks.
+
+4. Separateness. This firmware image is a separate work from the GPL-licensed
+   driver in this repository. It is loaded at runtime by the driver and is not
+   a derivative work of, and is not linked into, the kernel module. The
+   driver's license (GPL-2.0-only, see LICENSE) does not apply to this file,
+   and this license does not apply to the driver.
+
+5. No warranty. THE FIRMWARE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND.
+   TO THE MAXIMUM EXTENT PERMITTED BY LAW, GENBASIC DISCLAIMS ALL WARRANTIES,
+   EXPRESS OR IMPLIED, AND SHALL NOT BE LIABLE FOR ANY DAMAGES ARISING FROM
+   THE USE OF THE FIRMWARE.
+
+For redistribution terms beyond the above, contact engineering@genbasic.com.

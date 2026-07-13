@@ -1,0 +1,41 @@
+# Kbuild / out-of-tree build outputs
+*.o
+*.o.*
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+.*.cmd
+*.symvers
+*.order
+Module.symvers
+modules.order
+.tmp_versions/
+*.a
+*.ur-safe
+
+# Editor / OS cruft
+*~
+*.swp
+.DS_Store
+
+# Packaging build outputs
+../*.deb
+../*.rpm
+../*.buildinfo
+../*.changes
+debian/.debhelper/
+debian/rf-2a4m1-dkms/
+debian/rf-2a4m1-firmware/
+debian/files
+debian/*.substvars
+debian/*.log
+*.tar.gz
+*.tar.xz
+
+# Firmware build intermediates (the shipped rf-2a4m1.bin is tracked)
+firmware/*.elf
+firmware/*.ilm
+firmware/*.dlm
+firmware/build/

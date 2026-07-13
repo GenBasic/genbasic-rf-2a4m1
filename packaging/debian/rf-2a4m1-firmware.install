@@ -1,0 +1,2 @@
+firmware/rf-2a4m1.bin            lib/firmware/rf-2a4m1/
+conf/modprobe.d/rf-2a4m1.conf    etc/modprobe.d/

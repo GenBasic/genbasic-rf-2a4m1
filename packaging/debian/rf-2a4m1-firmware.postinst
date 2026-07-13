@@ -1,0 +1,21 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+set -e
+
+case "$1" in
+  configure)
+    # Reindex modaliases so the blacklist takes effect and rf_2a4m1 resolves.
+    depmod -a || true
+    # Bake the blacklist into early boot so the generic driver does not bind a
+    # dongle already plugged in at boot time.
+    if command -v update-initramfs >/dev/null 2>&1; then
+      update-initramfs -u || true
+    fi
+    # Capture a device already plugged in at install time, no reboot needed.
+    modprobe -r mt7601u 2>/dev/null || true
+    udevadm trigger --subsystem-match=usb 2>/dev/null || true
+    ;;
+esac
+
+#DEBHELPER#
+exit 0

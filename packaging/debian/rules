@@ -1,0 +1,10 @@
+#!/usr/bin/make -f
+# SPDX-License-Identifier: GPL-2.0-only
+
+export DEB_VERSION := $(shell dpkg-parsechangelog -SVersion | sed 's/-[^-]*$$//')
+
+%:
+	dh $@ --with dkms
+
+override_dh_dkms:
+	dh_dkms -V $(DEB_VERSION)

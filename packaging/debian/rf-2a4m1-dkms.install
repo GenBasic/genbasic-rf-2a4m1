@@ -1,0 +1,5 @@
+src/*        usr/src/rf-2a4m1-#MODULE_VERSION#/src/
+Kbuild       usr/src/rf-2a4m1-#MODULE_VERSION#/
+Makefile     usr/src/rf-2a4m1-#MODULE_VERSION#/
+dkms.conf    usr/src/rf-2a4m1-#MODULE_VERSION#/
+VERSION      usr/src/rf-2a4m1-#MODULE_VERSION#/

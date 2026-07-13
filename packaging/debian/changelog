@@ -1,0 +1,6 @@
+rf-2a4m1-dkms (1.0.0-1) unstable; urgency=medium
+
+  * Initial packaging skeleton: rf-2a4m1-dkms (GPL source) +
+    rf-2a4m1-firmware (on-chip image), DKMS build, driver-binding config.
+
+ -- GenBasic <engineering@genbasic.com>  Mon, 13 Jul 2026 00:00:00 +0000
