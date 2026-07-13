@@ -14,6 +14,22 @@ source-built kernel module plus a firmware image the device runs:
 - **`rf-2a4m1-firmware`** — the firmware image `rf-2a4m1.bin` that the adapter
   runs. It is loaded at runtime and is never linked into the kernel module.
 
+## Capabilities
+
+Single-band 2.4 GHz, 1×1 (1T1R) 802.11b/g/n:
+
+- **PHY:** 802.11b/g/n, HT20 / HT40, MCS 0–7 (up to 150 Mbps at HT40).
+- **Modes:** station, access point, monitor (with injection).
+- **Security:** WPA2-PSK, WPA3-SAE, OWE, and 802.11w PMF; legacy WEP / TKIP.
+- **QoS:** WMM / EDCA.
+
+Not supported: Enterprise 802.1X / EAP, and — as a 1×1 2.4 GHz radio — MIMO,
+5/6 GHz, VHT / HE / EHT, or channels wider than 40 MHz.
+
+`iw list` advertises the 2.4 GHz band (channels 1–13), the b/g/n bitrates and
+HT MCS 0–7, the station/AP/monitor interface modes, and the WEP / TKIP /
+CCMP-128 / BIP-CMAC-128 cipher suites.
+
 ## Status
 
 Early scaffold: the repository layout, build files, and packaging are in place;
