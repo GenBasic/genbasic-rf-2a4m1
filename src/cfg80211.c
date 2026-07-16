@@ -175,7 +175,7 @@ static int rf_2a4m1_ndo_stop(struct net_device *ndev)
 static netdev_tx_t rf_2a4m1_ndo_start_xmit(struct sk_buff *skb,
 					   struct net_device *ndev)
 {
-	struct rf_2a4m1_dev *dev = *(struct rf_2a4m1_dev **)netdev_priv(ndev);
+	struct rf_2a4m1_dev *dev = rf_2a4m1_from_ndev(ndev);
 
 	/*
 	 * The core's SME shapes the 802.3 payload into an 802.11 data frame
@@ -307,7 +307,7 @@ static bool rf_2a4m1_connect_derive_pmk(const struct cfg80211_connect_params *co
 static int rf_2a4m1_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 				struct cfg80211_connect_params *conn)
 {
-	struct rf_2a4m1_dev *dev = *(struct rf_2a4m1_dev **)wiphy_priv(wiphy);
+	struct rf_2a4m1_dev *dev = rf_2a4m1_from_wiphy(wiphy);
 	rf_2a4m1_mac_addr peer;
 	u8 pmk[RF_2A4M1_SME_PMK_LEN] = { 0 };
 	bool have_pmk;
@@ -354,7 +354,7 @@ static int rf_2a4m1_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 static int rf_2a4m1_cfg_disconnect(struct wiphy *wiphy, struct net_device *ndev,
 				   u16 reason_code)
 {
-	struct rf_2a4m1_dev *dev = *(struct rf_2a4m1_dev **)wiphy_priv(wiphy);
+	struct rf_2a4m1_dev *dev = rf_2a4m1_from_wiphy(wiphy);
 
 	dev->connect_pending = false;
 	cancel_delayed_work(&dev->connect_work);
@@ -367,7 +367,7 @@ static int rf_2a4m1_cfg_add_key(struct wiphy *wiphy, struct net_device *ndev,
 				int link_id, u8 key_index, bool pairwise,
 				const u8 *mac_addr, struct key_params *params)
 {
-	struct rf_2a4m1_dev *dev = *(struct rf_2a4m1_dev **)wiphy_priv(wiphy);
+	struct rf_2a4m1_dev *dev = rf_2a4m1_from_wiphy(wiphy);
 	struct rf_2a4m1_key k;
 
 	memset(&k, 0, sizeof(k));
@@ -390,7 +390,7 @@ static int rf_2a4m1_cfg_del_key(struct wiphy *wiphy, struct net_device *ndev,
 				int link_id, u8 key_index, bool pairwise,
 				const u8 *mac_addr)
 {
-	struct rf_2a4m1_dev *dev = *(struct rf_2a4m1_dev **)wiphy_priv(wiphy);
+	struct rf_2a4m1_dev *dev = rf_2a4m1_from_wiphy(wiphy);
 	struct rf_2a4m1_key k;
 
 	memset(&k, 0, sizeof(k));	/* cipher 0 = clear the slot */
@@ -475,8 +475,7 @@ int rf_2a4m1_cfg80211_register(struct rf_2a4m1_dev *dev)
 	struct net_device *ndev;
 	int ret;
 
-	/* wiphy_priv() stores a pointer back to dev (see the priv-size alloc). */
-	*(struct rf_2a4m1_dev **)wiphy_priv(dev->wiphy) = dev;
+	rf_2a4m1_set_wiphy_dev(dev->wiphy, dev);
 
 	INIT_DELAYED_WORK(&dev->connect_work, rf_2a4m1_connect_worker);
 
@@ -492,7 +491,7 @@ int rf_2a4m1_cfg80211_register(struct rf_2a4m1_dev *dev)
 		ret = -ENOMEM;
 		goto err_wiphy;
 	}
-	*(struct rf_2a4m1_dev **)netdev_priv(ndev) = dev;
+	rf_2a4m1_set_ndev_dev(ndev, dev);
 	dev->ndev = ndev;
 
 	dev->wdev.wiphy = dev->wiphy;

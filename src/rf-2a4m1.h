@@ -119,6 +119,41 @@ struct rf_2a4m1_dev {
 	bool			connect_pending;
 };
 
+/*
+ * Device lookup from a wiphy / net_device.
+ *
+ * Both objects are allocated with priv_size = sizeof(struct rf_2a4m1_dev *), so
+ * their priv slot holds a POINTER to the separately-allocated device rather than
+ * the device itself (see rf_2a4m1_wiphy_alloc() + rf_2a4m1_cfg80211_register()).
+ *
+ * ALWAYS use these accessors and never open-code the conversion: wiphy_priv() and
+ * netdev_priv() return void *, so omitting the extra dereference is type-legal C
+ * that silently yields a pointer to the priv slot itself -- every subsequent
+ * dev->... then reads past the allocation. No compiler or static checker can
+ * catch that; keeping the indirection in these four helpers is what prevents it.
+ */
+static inline struct rf_2a4m1_dev *rf_2a4m1_from_wiphy(struct wiphy *wiphy)
+{
+	return *(struct rf_2a4m1_dev **)wiphy_priv(wiphy);
+}
+
+static inline struct rf_2a4m1_dev *rf_2a4m1_from_ndev(struct net_device *ndev)
+{
+	return *(struct rf_2a4m1_dev **)netdev_priv(ndev);
+}
+
+static inline void rf_2a4m1_set_wiphy_dev(struct wiphy *wiphy,
+					  struct rf_2a4m1_dev *dev)
+{
+	*(struct rf_2a4m1_dev **)wiphy_priv(wiphy) = dev;
+}
+
+static inline void rf_2a4m1_set_ndev_dev(struct net_device *ndev,
+					 struct rf_2a4m1_dev *dev)
+{
+	*(struct rf_2a4m1_dev **)netdev_priv(ndev) = dev;
+}
+
 /* --- src/usb.c (kernel USB HAL) --- */
 int rf_2a4m1_usb_probe_setup(struct rf_2a4m1_dev *dev);
 int rf_2a4m1_usb_load_firmware(struct rf_2a4m1_dev *dev,
