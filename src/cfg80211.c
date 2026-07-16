@@ -307,7 +307,7 @@ static bool rf_2a4m1_connect_derive_pmk(const struct cfg80211_connect_params *co
 static int rf_2a4m1_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 				struct cfg80211_connect_params *conn)
 {
-	struct rf_2a4m1_dev *dev = wiphy_priv(wiphy);
+	struct rf_2a4m1_dev *dev = *(struct rf_2a4m1_dev **)wiphy_priv(wiphy);
 	rf_2a4m1_mac_addr peer;
 	u8 pmk[RF_2A4M1_SME_PMK_LEN] = { 0 };
 	bool have_pmk;
@@ -354,7 +354,7 @@ static int rf_2a4m1_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 static int rf_2a4m1_cfg_disconnect(struct wiphy *wiphy, struct net_device *ndev,
 				   u16 reason_code)
 {
-	struct rf_2a4m1_dev *dev = wiphy_priv(wiphy);
+	struct rf_2a4m1_dev *dev = *(struct rf_2a4m1_dev **)wiphy_priv(wiphy);
 
 	dev->connect_pending = false;
 	cancel_delayed_work(&dev->connect_work);
@@ -367,7 +367,7 @@ static int rf_2a4m1_cfg_add_key(struct wiphy *wiphy, struct net_device *ndev,
 				int link_id, u8 key_index, bool pairwise,
 				const u8 *mac_addr, struct key_params *params)
 {
-	struct rf_2a4m1_dev *dev = wiphy_priv(wiphy);
+	struct rf_2a4m1_dev *dev = *(struct rf_2a4m1_dev **)wiphy_priv(wiphy);
 	struct rf_2a4m1_key k;
 
 	memset(&k, 0, sizeof(k));
@@ -390,7 +390,7 @@ static int rf_2a4m1_cfg_del_key(struct wiphy *wiphy, struct net_device *ndev,
 				int link_id, u8 key_index, bool pairwise,
 				const u8 *mac_addr)
 {
-	struct rf_2a4m1_dev *dev = wiphy_priv(wiphy);
+	struct rf_2a4m1_dev *dev = *(struct rf_2a4m1_dev **)wiphy_priv(wiphy);
 	struct rf_2a4m1_key k;
 
 	memset(&k, 0, sizeof(k));	/* cipher 0 = clear the slot */
