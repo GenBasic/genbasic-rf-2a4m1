@@ -1,6 +1,15 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * RF-2A4M1 (GenBasic) 2.4 GHz USB Wi-Fi driver — private header.
+ * RF-2A4M1 (GenBasic) 2.4 GHz USB Wi-Fi driver - private header.
+ *
+ * A single, fully-GPL cfg80211 kernel module: the 802.11 MAC/MLME
+ * core drives the MT7601U silicon through an in-module HAL vtable, and a
+ * kernel USB HAL realizes that vtable over usbcore.  The MAC runs host-side in
+ * the module's core (a FullMAC-from-host design that registers a wiphy and a
+ * net_device with cfg80211 - the module carries its own MAC and touches no
+ * mac80211 ABI).  The only proprietary artifact is the on-chip firmware
+ * rf-2a4m1.bin, loaded at runtime via request_firmware().
+ *
  * Copyright (C) GenBasic.
  */
 #ifndef RF_2A4M1_H
@@ -8,19 +17,36 @@
 
 #include <linux/types.h>
 #include <linux/mutex.h>
+#include <linux/usb.h>
 #include <linux/workqueue.h>
+#include <net/cfg80211.h>
 
-#define RF_2A4M1_VERSION        "1.0.0"
+/* The MAC/MLME/crypto core (compiled from GPL source into this same .ko).
+ * It reaches the kernel only through the HAL vtable declared here. */
+#include "rf_2a4m1_core.h"
+
+#define RF_2A4M1_VERSION	"1.0.0"
 
 /* Firmware image, loaded at runtime from /lib/firmware/. */
-#define RF_2A4M1_FIRMWARE       "rf-2a4m1/rf-2a4m1.bin"
+#define RF_2A4M1_FIRMWARE	"rf-2a4m1/rf-2a4m1.bin"
 
-/* Firmware-image compatibility gate (asserted after the container header parse,
- * before upload). The family tag distinguishes an RF-2A4M1 image from any other
- * image sharing the same on-disk container; the min-version floor prevents a
- * newer driver from driving an incompatible older image. */
-#define RF_2A4M1_FW_FAMILY_TAG  0x2a41
-#define RF_2A4M1_FW_MIN_VER     0x1000
+/* USB bulk endpoints, in enumeration order (6 OUT / 2 IN on the MT7601U USB
+ * interface).  Index 0 OUT is the in-band MCU command endpoint; OUT 1..4 are
+ * the EDCA access-category queues; IN 0 is the packet-RX endpoint. */
+#define RF_2A4M1_N_EP_OUT	6
+#define RF_2A4M1_N_EP_IN	2
+#define RF_2A4M1_EP_OUT_CMD	0	/* in-band command / firmware DMA */
+#define RF_2A4M1_EP_OUT_DATA	2	/* AC_BE data queue */
+#define RF_2A4M1_EP_IN_RX	0	/* packet RX */
+#define RF_2A4M1_EP_IN_CMD	1	/* MCU command-response */
+
+/* Connect-completion poll (glue-side up-call driver; see cfg80211.c). */
+#define RF_2A4M1_CONNECT_POLL_MS	50
+#define RF_2A4M1_CONNECT_MAX_POLLS	60	/* ~3 s to reach CONNECTED */
+
+/* RX URB ring depth (bulk-IN pipeline). */
+#define RF_2A4M1_RX_URBS	4
+#define RF_2A4M1_RX_BUF_SZ	2048
 
 /* Device lifecycle. */
 enum rf_2a4m1_state {
@@ -30,16 +56,88 @@ enum rf_2a4m1_state {
 	RF_2A4M1_STATE_REMOVING,
 };
 
+/* One RX URB + its coherent buffer. */
+struct rf_2a4m1_rx_urb {
+	struct urb		*urb;
+	u8			*buf;
+	struct rf_2a4m1_dev	*dev;
+};
+
+/* Cached silicon parameters read from the chip EEPROM (efuse) at bring-up:
+ * the MAC address plus the per-channel PHY parameters the channel program
+ * needs.  Populated by rf_2a4m1_chip_init(); see src/usb.c. */
+struct rf_2a4m1_eeprom {
+	u8	mac[6];
+	u8	rf_freq_off;
+	s8	lna_gain;
+	s8	ref_temp;
+	u8	chan_pwr[14];		/* per-channel target TX power */
+	s8	cck_bw20[2];
+	s8	ofdm_bw20[4];
+	bool	valid;
+};
+
 struct rf_2a4m1_dev {
 	struct usb_device	*udev;
-	struct wiphy		*wiphy;		/* cfg80211 FullMAC: the module's own MAC */
-	struct net_device	*ndev;
+	struct usb_interface	*intf;
+	struct wiphy		*wiphy;
+	struct net_device	*ndev;		/* FullMAC: MAC in the core */
+	struct wireless_dev	wdev;
 	struct device		*dev;
 	enum rf_2a4m1_state	state;
 	struct mutex		lock;
 	struct workqueue_struct	*wq;
-	/* USB HAL, MAC core, and cfg80211 members are added by the modules that
-	 * own them (src/usb.c, src/core/, src/cfg80211.c). */
+
+	/* Discovered bulk-endpoint addresses (bEndpointAddress). */
+	u8			out_eps[RF_2A4M1_N_EP_OUT];
+	u8			in_eps[RF_2A4M1_N_EP_IN];
+	int			n_out, n_in;
+
+	/* The in-module HAL: the core calls hal.ops->* (installed by src/usb.c);
+	 * the kernel USB HAL implements them over usbcore. */
+	struct rf_2a4m1_hal	hal;
+
+	/* The SME/MLME instance the cfg80211 ops drive (the MAC runs
+	 * host-side in this module's core). */
+	struct rf_2a4m1_sme	sme;
+
+	/* RX URB ring. */
+	struct rf_2a4m1_rx_urb	rx[RF_2A4M1_RX_URBS];
+
+	rf_2a4m1_mac_addr	macaddr;
+
+	/* Chip bring-up state (src/usb.c). */
+	struct rf_2a4m1_eeprom	ee;
+	bool			hw_inited;
+	int			cur_channel;
+	u8			mcu_seq;	/* MCU command-response sequence */
+
+	/* Connect-completion up-call driver (src/cfg80211.c). */
+	struct delayed_work	connect_work;
+	u8			connect_bssid[RF_2A4M1_ETH_ALEN];
+	unsigned int		connect_polls;
+	bool			connect_pending;
 };
+
+/* --- src/usb.c (kernel USB HAL) --- */
+int rf_2a4m1_usb_probe_setup(struct rf_2a4m1_dev *dev);
+int rf_2a4m1_usb_load_firmware(struct rf_2a4m1_dev *dev,
+			       const u8 *fw, size_t fw_len);
+void rf_2a4m1_usb_hal_init(struct rf_2a4m1_dev *dev);
+int rf_2a4m1_usb_rx_start(struct rf_2a4m1_dev *dev);
+void rf_2a4m1_usb_rx_stop(struct rf_2a4m1_dev *dev);
+
+/* MAC/BBP/RF chip bring-up (the register init sequence run once after the MCU
+ * firmware boots; reads the EEPROM MAC into dev->macaddr + dev->ee). */
+int rf_2a4m1_chip_init(struct rf_2a4m1_dev *dev, int channel);
+
+/* register access (over usb_control_msg) - exposed for the fw-load path. */
+u32 rf_2a4m1_reg_read(struct rf_2a4m1_dev *dev, u16 offset);
+int rf_2a4m1_reg_write(struct rf_2a4m1_dev *dev, u16 offset, u32 val);
+
+/* --- src/cfg80211.c --- */
+int rf_2a4m1_cfg80211_register(struct rf_2a4m1_dev *dev);
+void rf_2a4m1_cfg80211_unregister(struct rf_2a4m1_dev *dev);
+struct wiphy *rf_2a4m1_wiphy_alloc(struct device *dev);
 
 #endif /* RF_2A4M1_H */
