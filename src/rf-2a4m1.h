@@ -46,7 +46,23 @@
 
 /* RX URB ring depth (bulk-IN pipeline). */
 #define RF_2A4M1_RX_URBS	4
-#define RF_2A4M1_RX_BUF_SZ	2048
+/*
+ * One bulk-IN buffer must hold a WHOLE aggregate, not one frame: the chip is
+ * programmed to pack up to MT_USB_AGGR_SIZE_LIMIT (28) * 1024 B into a single
+ * transfer. A buffer smaller than that aggregate overflows the URB (-EOVERFLOW)
+ * and loses the transfer, so size it to the limit with headroom, matching the
+ * in-tree driver's 32 KB (PAGE_SIZE << MT_RX_ORDER) RX buffers.
+ */
+#define RF_2A4M1_RX_BUF_SZ	32768
+/*
+ * TX is sized SEPARATELY from RX and must stay well under KMALLOC_MAX_CACHE_SIZE:
+ * rf_2a4m1_op_tx() allocates per-frame in ATOMIC context, where the large-kmalloc
+ * path (which forwards to alloc_pages) sleeps and panics. One TX frame is only
+ * TXWI + MPDU + DMA framing, so borrowing the RX aggregate size here would not be
+ * merely wasteful -- it is unsafe. (The MCU path keeps the RX size deliberately:
+ * it also drains the packet-RX endpoint, and it runs at probe in process context.)
+ */
+#define RF_2A4M1_TX_BUF_SZ	2048
 
 /* Device lifecycle. */
 enum rf_2a4m1_state {
@@ -103,6 +119,27 @@ struct rf_2a4m1_dev {
 
 	/* RX URB ring. */
 	struct rf_2a4m1_rx_urb	rx[RF_2A4M1_RX_URBS];
+	/*
+	 * In-flight async TX URBs. Data TX is submitted from the core's RX
+	 * handler, so it cannot use the synchronous usb_bulk_msg(); the anchor
+	 * is what lets teardown wait for the fire-and-forget URBs, without which
+	 * one completing after the module unloads would call into freed code.
+	 */
+	struct usb_anchor	tx_anchor;
+	/*
+	 * RX hand-off to PROCESS context.
+	 *
+	 * A URB completes in softirq, but the core answers a received frame by
+	 * calling straight back down into the HAL (set_lower_mac, reg_read, tx
+	 * ...), and those do synchronous USB control/bulk transfers that SLEEP.
+	 * Delivering from the completion handler is therefore a "sleeping
+	 * function called from invalid context" BUG -- one that only fires once
+	 * a real AP answers, because that is the first time the core has any
+	 * reason to talk back. Queue the segments here and let a work item
+	 * deliver them where sleeping is legal.
+	 */
+	struct sk_buff_head	rx_queue;
+	struct work_struct	rx_work;
 
 	rf_2a4m1_mac_addr	macaddr;
 
@@ -126,6 +163,25 @@ struct rf_2a4m1_dev {
 	 */
 	atomic_t		rx_urbs;	/* RX URB completions (status==0) */
 	atomic_t		rx_frames;	/* frames parsed + delivered up   */
+	/*
+	 * A bulk-IN transfer carries an AGGREGATE of DMA segments, not one frame
+	 * (the chip is told to aggregate; see MT_USB_DMA_CFG_RX_BULK_AGG_EN).
+	 * rx_frames alone therefore cannot tell "the air is quiet" apart from
+	 * "the air is busy and we are dropping all but the first frame of every
+	 * transfer" -- opposite root causes for a starved ring. Count the
+	 * segments the chip actually delivered against the frames we consumed.
+	 */
+	atomic_t		rx_segs;	/* DMA segments present in the ring */
+	atomic_t		rx_seg_max;	/* most segments in one transfer    */
+	/*
+	 * A URB that completes with an error is NOT resubmitted, so each one
+	 * permanently shrinks the ring: RF_2A4M1_RX_URBS such errors and RX is
+	 * dead for good. That is invisible in rx_urbs (which only counts
+	 * successes), so count the failures and keep the last status.
+	 */
+	atomic_t		rx_urb_errs;	/* completions with status != 0     */
+	atomic_t		rx_urb_last_err;/* the last such status (-errno)    */
+	atomic_t		rx_bcn_logged;	/* bounds the per-beacon source log */
 	/* Mgmt frames by 802.11 subtype: 8=beacon 5=probe-resp 11=auth
 	 * 1=assoc-resp. The SME leaves SCANNING only on a PROBE_RESP and has no
 	 * beacon frame type at all, so this separates "the AP never answered our

@@ -160,6 +160,7 @@ static int rf_2a4m1_poll(struct rf_2a4m1_dev *dev, u16 reg,
 
 /* ------------------------------------------------------------------ */
 /* Bulk transfers. */
+/* Synchronous bulk-OUT. SLEEPS -- process context only (the MCU command path). */
 static int rf_2a4m1_bulk_out(struct rf_2a4m1_dev *dev, int ep_idx,
 			     const void *data, int len, int *sent)
 {
@@ -171,13 +172,62 @@ static int rf_2a4m1_bulk_out(struct rf_2a4m1_dev *dev, int ep_idx,
 	return usb_bulk_msg(dev->udev, pipe, (void *)data, len, sent, 1000);
 }
 
+/* Async TX URB completion: the transfer buffer and the URB are ours alone. */
+static void rf_2a4m1_tx_complete(struct urb *urb)
+{
+	kfree(urb->transfer_buffer);
+	usb_free_urb(urb);
+}
+
+/*
+ * Asynchronous bulk-OUT -- ATOMIC-SAFE, and the only legal way to radiate a
+ * frame from the RX completion path.
+ *
+ * The core drives TX from its RX handler (an AP's probe-response provokes the
+ * auth frame, its auth response the assoc, and so on), which runs in softirq.
+ * usb_bulk_msg() allocates a URB and SLEEPS until it completes, so calling it
+ * from there is a "sleeping function called from invalid context" BUG that
+ * cascades into a panic. Hand the frame to usbcore and return instead; @data
+ * must be heap-allocated and is owned by the completion handler on success.
+ */
+static int rf_2a4m1_bulk_out_async(struct rf_2a4m1_dev *dev, int ep_idx,
+				   void *data, int len)
+{
+	struct urb *urb;
+	unsigned int pipe;
+	int ret;
+
+	if (ep_idx >= dev->n_out)
+		return -EINVAL;
+	urb = usb_alloc_urb(0, GFP_ATOMIC);
+	if (!urb)
+		return -ENOMEM;
+	pipe = usb_sndbulkpipe(dev->udev,
+			       dev->out_eps[ep_idx] & USB_ENDPOINT_NUMBER_MASK);
+	usb_fill_bulk_urb(urb, dev->udev, pipe, data, len,
+			  rf_2a4m1_tx_complete, dev);
+	usb_anchor_urb(urb, &dev->tx_anchor);
+	ret = usb_submit_urb(urb, GFP_ATOMIC);
+	if (ret) {
+		usb_unanchor_urb(urb);
+		usb_free_urb(urb);	/* caller still owns @data */
+		return ret;
+	}
+	return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Endpoint discovery: record the bulk IN/OUT addresses in enumeration order. */
+static void rf_2a4m1_rx_work(struct work_struct *work);
+
 int rf_2a4m1_usb_probe_setup(struct rf_2a4m1_dev *dev)
 {
 	struct usb_host_interface *alt = dev->intf->cur_altsetting;
 	int i;
 
+	init_usb_anchor(&dev->tx_anchor);
+	skb_queue_head_init(&dev->rx_queue);
+	INIT_WORK(&dev->rx_work, rf_2a4m1_rx_work);
 	dev->n_in = dev->n_out = 0;
 	for (i = 0; i < alt->desc.bNumEndpoints; i++) {
 		struct usb_endpoint_descriptor *ep = &alt->endpoint[i].desc;
@@ -1309,6 +1359,17 @@ static int rf_2a4m1_mac_start_rx(struct rf_2a4m1_dev *dev)
 			   MT_MAC_SYS_CTRL_ENABLE_TX | MT_MAC_SYS_CTRL_ENABLE_RX);
 	rf_2a4m1_poll(dev, MT_WPDMA_GLO_CFG,
 		      MT_WPDMA_GLO_CFG_TX_DMA_BUSY | MT_WPDMA_GLO_CFG_RX_DMA_BUSY, 0, 50);
+	/*
+	 * Read the filter back rather than trusting the write: every bit in
+	 * MT_RX_FILTR_CFG DROPS a class of frames, so a stray bit here silently
+	 * removes a whole frame type from the air (a beacon-shaped hole looks
+	 * exactly like "no AP in range"). Expect 0x3 = drop CRC/PHY errors only.
+	 */
+	dev_info(dev->dev,
+		 "mac rx enabled: RX_FILTR_CFG=0x%08x MAC_SYS_CTRL=0x%08x USB_DMA_CFG=0x%08x\n",
+		 rf_2a4m1_reg_read(dev, MT_RX_FILTR_CFG),
+		 rf_2a4m1_reg_read(dev, MT_MAC_SYS_CTRL),
+		 rf_2a4m1_reg_read(dev, MT_USB_DMA_CFG));
 	return 0;
 }
 
@@ -1468,34 +1529,115 @@ to_core:
 	return false;
 }
 
-/* RX URB completion: unwrap the DMA frame, parse the RXWI into rxinfo, bridge a
- * received DATA frame to the network stack (802.11->802.3), or otherwise
- * deliver it upward through the core's registered rx_cb; then re-arm. */
+static void rf_2a4m1_rx_process_seg(struct rf_2a4m1_dev *dev,
+				    const u8 *seg, u16 seg_len);
+
+/*
+ * RX bottom half, in PROCESS context: drain the queued segments and deliver
+ * them to the core. Sleeping is legal here, which is the whole point -- the
+ * core answers a frame by calling sleeping HAL ops straight back down.
+ */
+static void rf_2a4m1_rx_work(struct work_struct *work)
+{
+	struct rf_2a4m1_dev *dev = container_of(work, struct rf_2a4m1_dev,
+						rx_work);
+	struct sk_buff *skb;
+
+	while ((skb = skb_dequeue(&dev->rx_queue))) {
+		if (dev->state != RF_2A4M1_STATE_REMOVING)
+			rf_2a4m1_rx_process_seg(dev, skb->data, skb->len);
+		kfree_skb(skb);
+	}
+}
+
+/* RX URB completion (softirq): walk every DMA segment the transfer aggregated,
+ * queue each for the process-context worker, then re-arm the URB. */
 static void rf_2a4m1_rx_complete(struct urb *urb)
 {
 	struct rf_2a4m1_rx_urb *rx = urb->context;
 	struct rf_2a4m1_dev *dev = rx->dev;
-	const u8 *rxwi, *payload;
-	u16 rxwi_len, payload_len;
-	struct rf_2a4m1_rxinfo info;
-	int ret;
 
 	if (urb->status) {
-		if (urb->status != -ENOENT && urb->status != -ESHUTDOWN &&
-		    urb->status != -ECONNRESET)
-			dev_dbg(dev->dev, "rx urb status %d\n", urb->status);
-		return; /* not resubmitted on error/teardown */
+		atomic_inc(&dev->rx_urb_errs);
+		atomic_set(&dev->rx_urb_last_err, urb->status);
+		/*
+		 * Teardown is terminal; anything else is a transient transfer
+		 * error and MUST be re-armed. A URB abandoned here never returns
+		 * to the ring, so N such errors silently reduce RX to nothing --
+		 * a permanent, invisible failure that looks like dead air.
+		 */
+		if (urb->status == -ENOENT || urb->status == -ESHUTDOWN ||
+		    urb->status == -ECONNRESET)
+			return;
+		dev_dbg(dev->dev, "rx urb status %d\n", urb->status);
+		goto resubmit;
 	}
 	atomic_inc(&dev->rx_urbs);
 
 	if (urb->actual_length < 40)
 		goto resubmit;
 
-	ret = rf_2a4m1_mt7601u_usb_rx_unwrap(rx->buf, urb->actual_length,
+	/*
+	 * A bulk-IN transfer carries an AGGREGATE of DMA segments (the chip is
+	 * configured with MT_USB_DMA_CFG_RX_BULK_AGG_EN), so walk every segment.
+	 * Consuming only the first silently discards the rest of the transfer:
+	 * the in-tree driver loops the same way (mt7601u_rx_process_entry), and
+	 * an Assoc-Resp and the EAPOL-Key M1 that follows it routinely land in
+	 * ONE transfer -- taking only the head drops the M1 and the 4-way stalls.
+	 */
+	{
+		u32 off = 0, n = 0;
+		bool queued = false;
+
+		while (off + RF_2A4M1_MT_DMA_HDRS <= urb->actual_length) {
+			u16 dlen = get_unaligned_le16(rx->buf + off);
+			u32 slen = RF_2A4M1_MT_DMA_HDRS + dlen;
+			struct sk_buff *skb;
+
+			if (!dlen || (dlen & 0x3) ||
+			    off + slen > urb->actual_length)
+				break;
+			n++;
+			/*
+			 * Copy the segment out and hand it to the work item: the
+			 * URB's buffer is re-armed below and must not outlive
+			 * this callback.
+			 */
+			skb = alloc_skb(slen, GFP_ATOMIC);
+			if (skb) {
+				skb_put_data(skb, rx->buf + off, slen);
+				skb_queue_tail(&dev->rx_queue, skb);
+				queued = true;
+			}
+			off += slen;
+		}
+		atomic_add(n, &dev->rx_segs);
+		if (n > (u32)atomic_read(&dev->rx_seg_max))
+			atomic_set(&dev->rx_seg_max, n);
+		if (queued)
+			schedule_work(&dev->rx_work);
+	}
+
+resubmit:
+	if (dev->state != RF_2A4M1_STATE_REMOVING)
+		usb_submit_urb(urb, GFP_ATOMIC);
+}
+
+/* Consume ONE DMA segment: unwrap the framing, parse the RXWI, then either
+ * bridge a DATA frame to the stack or hand the frame up to the core (SME). */
+static void rf_2a4m1_rx_process_seg(struct rf_2a4m1_dev *dev,
+				    const u8 *seg, u16 seg_len)
+{
+	const u8 *rxwi, *payload;
+	u16 rxwi_len, payload_len;
+	struct rf_2a4m1_rxinfo info;
+	int ret;
+
+	ret = rf_2a4m1_mt7601u_usb_rx_unwrap(seg, seg_len,
 					     &rxwi, &rxwi_len,
 					     &payload, &payload_len);
 	if (ret != RF_2A4M1_S8021X_OK)
-		goto resubmit;
+		return;
 
 	if (rf_2a4m1_mt7601u_parse_rxwi(rxwi, rxwi_len, payload, payload_len,
 					&info) == RF_2A4M1_S8021X_OK) {
@@ -1546,22 +1688,34 @@ static void rf_2a4m1_rx_complete(struct urb *urb)
 				 * dynamic debug when diagnosing why a connect
 				 * never leaves the scan state.
 				 */
-				if (sub == 8 || sub == 5)
-					dev_dbg(dev->dev,
-						"rx mgmt sub=%u rssi=%d snr=%d mcs=%u from %pM\n",
-						sub, info.rssi, info.snr,
-						info.mcs,
-						flen >= 16 ? info.data + 10 : info.data);
+				if (sub == 8 || sub == 5) {
+					/*
+					 * Log the first few with the SOURCE BSSID: which AP
+					 * we hear is the only direct evidence of the channel
+					 * the radio is REALLY on -- a retune that silently
+					 * does not take effect still delivers beacons, just
+					 * from the old channel's APs. Bounded so a busy cell
+					 * cannot flood the log.
+					 */
+					if (atomic_inc_return(&dev->rx_bcn_logged) <= 10)
+						dev_info(dev->dev,
+							 "rx mgmt sub=%u rssi=%d snr=%d mcs=%u from %pM\n",
+							 sub, info.rssi, info.snr,
+							 info.mcs,
+							 flen >= 16 ? info.data + 10 : info.data);
+					else
+						dev_dbg(dev->dev,
+							"rx mgmt sub=%u rssi=%d snr=%d mcs=%u from %pM\n",
+							sub, info.rssi, info.snr,
+							info.mcs,
+							flen >= 16 ? info.data + 10 : info.data);
+				}
 			}
 		}
 
 		if (!rf_2a4m1_rx_to_netdev(dev, info.data, flen))
 			rf_2a4m1_hal_deliver_rx(&dev->hal, &info);
 	}
-
-resubmit:
-	if (dev->state != RF_2A4M1_STATE_REMOVING)
-		usb_submit_urb(urb, GFP_ATOMIC);
 }
 
 int rf_2a4m1_usb_rx_start(struct rf_2a4m1_dev *dev)
@@ -1608,6 +1762,15 @@ void rf_2a4m1_usb_rx_stop(struct rf_2a4m1_dev *dev)
 		kfree(rx->buf);
 		rx->buf = NULL;
 	}
+	/*
+	 * Order matters. The URBs are dead, so nothing new can be queued; now
+	 * flush the worker (which may still be delivering -- and delivering can
+	 * radiate), then wait out the TX URBs it submitted, then drop whatever
+	 * never got delivered.
+	 */
+	cancel_work_sync(&dev->rx_work);
+	usb_kill_anchored_urbs(&dev->tx_anchor);
+	skb_queue_purge(&dev->rx_queue);
 }
 
 /* --- ops --- */
@@ -1660,7 +1823,7 @@ static int rf_2a4m1_op_tx(struct rf_2a4m1_hal *h, struct rf_2a4m1_mpdu *m,
 	u8 txwi[RF_2A4M1_MT7601U_TXWI_SIZE];
 	u16 out_len = 0;
 	u8 *frame;
-	int ret, sent = 0;
+	int ret;
 	bool wiv = (tp->key_slot == 0xff);
 
 	ret = rf_2a4m1_mt7601u_build_txwi(txwi, tp, m);
@@ -1676,11 +1839,16 @@ static int rf_2a4m1_op_tx(struct rf_2a4m1_hal *h, struct rf_2a4m1_mpdu *m,
 	if (m->data && m->len)
 		atomic_set(&dev->tx_last_len, m->len);
 
-	frame = kmalloc(RF_2A4M1_RX_BUF_SZ, GFP_KERNEL);
+	/*
+	 * GFP_ATOMIC: the core calls this from the RX completion path (softirq),
+	 * not just from the connect work -- a sleeping allocation here is a
+	 * "scheduling while atomic" panic.
+	 */
+	frame = kmalloc(RF_2A4M1_TX_BUF_SZ, GFP_ATOMIC);
 	if (!frame)
 		return -ENOMEM;
 
-	ret = rf_2a4m1_mt7601u_usb_tx_wrap(frame, RF_2A4M1_RX_BUF_SZ,
+	ret = rf_2a4m1_mt7601u_usb_tx_wrap(frame, RF_2A4M1_TX_BUF_SZ,
 					   txwi, RF_2A4M1_MT7601U_TXWI_SIZE,
 					   m->data, m->len,
 					   MT_QSEL_EDCA, wiv, &out_len);
@@ -1688,8 +1856,13 @@ static int rf_2a4m1_op_tx(struct rf_2a4m1_hal *h, struct rf_2a4m1_mpdu *m,
 		kfree(frame);
 		return -EINVAL;
 	}
-	ret = rf_2a4m1_bulk_out(dev, RF_2A4M1_EP_OUT_DATA, frame, out_len, &sent);
-	kfree(frame);
+	/*
+	 * Async: this runs in softirq when the core answers a received frame.
+	 * On success @frame belongs to the completion handler.
+	 */
+	ret = rf_2a4m1_bulk_out_async(dev, RF_2A4M1_EP_OUT_DATA, frame, out_len);
+	if (ret)
+		kfree(frame);
 	return ret;
 }
 

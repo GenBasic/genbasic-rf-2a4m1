@@ -258,6 +258,18 @@ static void rf_2a4m1_connect_worker(struct work_struct *w)
 		dev_info(dev->dev,
 			 "connect: tx_calls=%d last_mpdu_len=%d (a valid 802.11 mgmt frame is >=24 B of header alone)\n",
 			 atomic_read(&dev->tx_calls), atomic_read(&dev->tx_last_len));
+		/*
+		 * The ring itself. segs>frames means the chip delivered frames we
+		 * threw away; urb_errs>0 means the ring is being dismantled one
+		 * URB at a time (RF_2A4M1_RX_URBS of them and RX is dead).
+		 */
+		dev_info(dev->dev,
+			 "connect: rx ring: segs=%d seg_max=%d urb_errs=%d last_err=%d (urbs=%d frames=%d of %d urbs x %d B)\n",
+			 atomic_read(&dev->rx_segs), atomic_read(&dev->rx_seg_max),
+			 atomic_read(&dev->rx_urb_errs),
+			 atomic_read(&dev->rx_urb_last_err),
+			 atomic_read(&dev->rx_urbs), atomic_read(&dev->rx_frames),
+			 RF_2A4M1_RX_URBS, RF_2A4M1_RX_BUF_SZ);
 		cfg80211_connect_timeout(dev->ndev, dev->connect_bssid, NULL, 0,
 					 GFP_KERNEL, NL80211_TIMEOUT_UNSPECIFIED);
 		return;
