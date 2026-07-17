@@ -1486,6 +1486,8 @@ static void rf_2a4m1_rx_complete(struct urb *urb)
 			dev_dbg(dev->dev, "rx urb status %d\n", urb->status);
 		return; /* not resubmitted on error/teardown */
 	}
+	atomic_inc(&dev->rx_urbs);
+
 	if (urb->actual_length < 40)
 		goto resubmit;
 
@@ -1518,6 +1520,31 @@ static void rf_2a4m1_rx_complete(struct urb *urb)
 		 * 4-way EAPOL, and pre-key Protected frames fall through to the
 		 * core (SME) path.
 		 */
+		atomic_inc(&dev->rx_frames);
+
+		if (flen >= 2 && info.data) {
+			u16 fc = (u16)(info.data[0] | ((u16)info.data[1] << 8));
+
+			if (((fc >> 2) & 3) == 0) {	/* 802.11 mgmt */
+				u8 sub = (fc >> 4) & 0xf;
+
+				atomic_inc(&dev->rx_mgmt_sub[sub]);
+				/*
+				 * Beacon / probe-response detail, incl. RSSI --
+				 * dev_dbg, not dev_info: in a busy 2.4 GHz cell
+				 * this fires many times per second. Enable via
+				 * dynamic debug when diagnosing why a connect
+				 * never leaves the scan state.
+				 */
+				if (sub == 8 || sub == 5)
+					dev_dbg(dev->dev,
+						"rx mgmt sub=%u rssi=%d snr=%d mcs=%u from %pM\n",
+						sub, info.rssi, info.snr,
+						info.mcs,
+						flen >= 16 ? info.data + 10 : info.data);
+			}
+		}
+
 		if (!rf_2a4m1_rx_to_netdev(dev, info.data, flen))
 			rf_2a4m1_hal_deliver_rx(&dev->hal, &info);
 	}

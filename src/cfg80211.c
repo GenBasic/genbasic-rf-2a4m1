@@ -227,6 +227,29 @@ static void rf_2a4m1_connect_worker(struct work_struct *w)
 	}
 	if (++dev->connect_polls > RF_2A4M1_CONNECT_MAX_POLLS) {
 		dev->connect_pending = false;
+		/*
+		 * Report WHERE the FSM stalled. Without this the timeout is
+		 * indistinguishable from "nothing happened": state names are
+		 * 0=INIT 1=SCANNING 2=AUTHED 3=ASSOCED 4=4WAY 5=CONNECTED
+		 * 6=FAILED. rx_packets tells TX-side vs RX-side failure apart.
+		 */
+		dev_info(dev->dev,
+			 "connect: TIMEOUT after %u polls (%u ms); sme.state=%u connected=%d ptk=%d gtk=%d rx_urbs=%d rx_frames=%d rx_packets=%lu rx_errors=%lu rx_dropped=%lu\n",
+			 dev->connect_polls,
+			 dev->connect_polls * RF_2A4M1_CONNECT_POLL_MS,
+			 dev->sme.state, dev->sme.connected,
+			 dev->sme.ptk_installed, dev->sme.gtk_installed,
+			 atomic_read(&dev->rx_urbs), atomic_read(&dev->rx_frames),
+			 dev->ndev->stats.rx_packets, dev->ndev->stats.rx_errors,
+			 dev->ndev->stats.rx_dropped);
+		dev_info(dev->dev,
+			 "connect: rx mgmt by subtype: beacon=%d probe_resp=%d auth=%d assoc_resp=%d probe_req=%d deauth=%d\n",
+			 atomic_read(&dev->rx_mgmt_sub[8]),
+			 atomic_read(&dev->rx_mgmt_sub[5]),
+			 atomic_read(&dev->rx_mgmt_sub[11]),
+			 atomic_read(&dev->rx_mgmt_sub[1]),
+			 atomic_read(&dev->rx_mgmt_sub[4]),
+			 atomic_read(&dev->rx_mgmt_sub[12]));
 		cfg80211_connect_timeout(dev->ndev, dev->connect_bssid, NULL, 0,
 					 GFP_KERNEL, NL80211_TIMEOUT_UNSPECIFIED);
 		return;
@@ -315,6 +338,30 @@ static int rf_2a4m1_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 	if (!conn->bssid)
 		return -EINVAL;
 	memcpy(peer.a, conn->bssid, RF_2A4M1_ETH_ALEN);
+
+	/*
+	 * Tune the chip to the target BSS's channel BEFORE starting the SME.
+	 * Chip init leaves the radio on its default channel, and nothing else in
+	 * the connect path programs it -- so without this the STA transmits auth
+	 * on the wrong channel, the AP (on another) never hears it, and the
+	 * connect just times out with the AP logging nothing at all.
+	 */
+	if (conn->channel) {
+		struct rf_2a4m1_chan_def cd = {
+			.band       = RF_2A4M1_HAL_BAND_2G4,
+			.center_mhz = conn->channel->center_freq,
+			.width_mhz  = 20,
+		};
+		int cret = dev->hal.ops->set_channel(&dev->hal, &cd);
+
+		if (cret < 0) {
+			dev_err(dev->dev, "connect: set_channel %u MHz failed (%d)\n",
+				conn->channel->center_freq, cret);
+			return cret;
+		}
+		dev_info(dev->dev, "connect: tuned to %u MHz (channel %d)\n",
+			 conn->channel->center_freq, dev->cur_channel);
+	}
 
 	/* Derive the real WPA2 PMK from the connect request (replaces the former
 	 * zero PMK) so the 4-way computes real, secret PTK/GTK session keys. */

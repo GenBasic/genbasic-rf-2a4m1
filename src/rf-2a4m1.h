@@ -117,6 +117,20 @@ struct rf_2a4m1_dev {
 	u8			connect_bssid[RF_2A4M1_ETH_ALEN];
 	unsigned int		connect_polls;
 	bool			connect_pending;
+
+	/*
+	 * RX instrumentation. ndev->stats.rx_packets only counts DATA frames
+	 * bridged to the stack, so it is 0 before association and cannot tell
+	 * "the chip hears nothing" apart from "frames arrive but the SME
+	 * rejects them" -- which are opposite root causes for a SCANNING stall.
+	 */
+	atomic_t		rx_urbs;	/* RX URB completions (status==0) */
+	atomic_t		rx_frames;	/* frames parsed + delivered up   */
+	/* Mgmt frames by 802.11 subtype: 8=beacon 5=probe-resp 11=auth
+	 * 1=assoc-resp. The SME leaves SCANNING only on a PROBE_RESP and has no
+	 * beacon frame type at all, so this separates "the AP never answered our
+	 * probe" from "it answered and the SME rejected it". */
+	atomic_t		rx_mgmt_sub[16];
 };
 
 /*
