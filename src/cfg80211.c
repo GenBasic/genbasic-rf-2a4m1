@@ -250,6 +250,14 @@ static void rf_2a4m1_connect_worker(struct work_struct *w)
 			 atomic_read(&dev->rx_mgmt_sub[1]),
 			 atomic_read(&dev->rx_mgmt_sub[4]),
 			 atomic_read(&dev->rx_mgmt_sub[12]));
+		dev_info(dev->dev,
+			 "connect: TARGET %pM: probe_resp=%d auth=%d\n",
+			 dev->connect_bssid,
+			 atomic_read(&dev->rx_proberesp_target),
+			 atomic_read(&dev->rx_auth_target));
+		dev_info(dev->dev,
+			 "connect: tx_calls=%d last_mpdu_len=%d (a valid 802.11 mgmt frame is >=24 B of header alone)\n",
+			 atomic_read(&dev->tx_calls), atomic_read(&dev->tx_last_len));
 		cfg80211_connect_timeout(dev->ndev, dev->connect_bssid, NULL, 0,
 					 GFP_KERNEL, NL80211_TIMEOUT_UNSPECIFIED);
 		return;

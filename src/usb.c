@@ -1529,6 +1529,16 @@ static void rf_2a4m1_rx_complete(struct urb *urb)
 				u8 sub = (fc >> 4) & 0xf;
 
 				atomic_inc(&dev->rx_mgmt_sub[sub]);
+				/* Was it the AP we were actually asked to join?
+				 * SA = addr2, at offset 10 of the mgmt header. */
+				if (flen >= 16 &&
+				    ether_addr_equal(info.data + 10,
+						     dev->connect_bssid)) {
+					if (sub == 5)
+						atomic_inc(&dev->rx_proberesp_target);
+					else if (sub == 11)
+						atomic_inc(&dev->rx_auth_target);
+				}
 				/*
 				 * Beacon / probe-response detail, incl. RSSI --
 				 * dev_dbg, not dev_info: in a busy 2.4 GHz cell
@@ -1656,6 +1666,15 @@ static int rf_2a4m1_op_tx(struct rf_2a4m1_hal *h, struct rf_2a4m1_mpdu *m,
 	ret = rf_2a4m1_mt7601u_build_txwi(txwi, tp, m);
 	if (ret != RF_2A4M1_S8021X_OK)
 		return -EINVAL;
+
+	/*
+	 * Count EVERY frame we hand the radio, and record its length. A valid
+	 * 802.11 management frame is >= 24 B of header alone, so a short MPDU
+	 * here means we are radiating something no AP can parse.
+	 */
+	atomic_inc(&dev->tx_calls);
+	if (m->data && m->len)
+		atomic_set(&dev->tx_last_len, m->len);
 
 	frame = kmalloc(RF_2A4M1_RX_BUF_SZ, GFP_KERNEL);
 	if (!frame)

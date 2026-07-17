@@ -131,6 +131,22 @@ struct rf_2a4m1_dev {
 	 * beacon frame type at all, so this separates "the AP never answered our
 	 * probe" from "it answered and the SME rejected it". */
 	atomic_t		rx_mgmt_sub[16];
+	/* Probe-responses whose SA is the BSSID we were asked to connect to.
+	 * rx_mgmt_sub[5] counts probe-responses from EVERY AP in the cell, so it
+	 * cannot answer "did the TARGET answer us?" -- which is the question when
+	 * a connect stalls in scan amid neighbouring APs. */
+	atomic_t		rx_proberesp_target;
+	atomic_t		rx_auth_target;
+	/*
+	 * TX instrumentation. Deliberately NOT an 802.11-subtype histogram: the
+	 * SME hands the HAL its own short internal frame, so decoding byte 0 as a
+	 * Frame Control field yields a plausible but meaningless subtype. Count
+	 * frames and record the length instead -- a valid 802.11 management frame
+	 * is >= 24 B of header alone, so a short MPDU here means we are radiating
+	 * something no AP can parse.
+	 */
+	atomic_t		tx_calls;	/* every frame handed to the radio */
+	atomic_t		tx_last_len;	/* length of the last MPDU radiated */
 };
 
 /*
