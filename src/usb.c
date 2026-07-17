@@ -543,6 +543,13 @@ out:
 #define MT_BEACON_TIME_CFG_MASK		0x001f0000u	/* TIMER_EN|SYNC|TBTT|BEACON_TX */
 #define MT_RX_STA_CNT0			0x1700
 #define MT_TX_STA_CNT0			0x170c
+/*
+ * RXWI rxinfo status word (the first word of the RXWI). BIT(14) flags the 2
+ * bytes of L2 padding the MAC inserts between a non-4-byte-aligned 802.11
+ * header and the payload.
+ */
+#define MT_RXINFO_L2PAD			BIT(14)
+
 #define MT_RX_FILTR_CFG			0x1400
 #define MT_RX_FILTR_CFG_CRC_ERR		BIT(0)
 #define MT_RX_FILTR_CFG_PHY_ERR		BIT(1)
@@ -1530,7 +1537,7 @@ to_core:
 }
 
 static void rf_2a4m1_rx_process_seg(struct rf_2a4m1_dev *dev,
-				    const u8 *seg, u16 seg_len);
+				    u8 *seg, u16 seg_len);
 
 /*
  * RX bottom half, in PROCESS context: drain the queued segments and deliver
@@ -1624,13 +1631,15 @@ resubmit:
 }
 
 /* Consume ONE DMA segment: unwrap the framing, parse the RXWI, then either
- * bridge a DATA frame to the stack or hand the frame up to the core (SME). */
+ * bridge a DATA frame to the stack or hand the frame up to the core (SME).
+ * @seg is writable (our own copy) -- removing the L2 pad rewrites it in place. */
 static void rf_2a4m1_rx_process_seg(struct rf_2a4m1_dev *dev,
-				    const u8 *seg, u16 seg_len)
+				    u8 *seg, u16 seg_len)
 {
 	const u8 *rxwi, *payload;
 	u16 rxwi_len, payload_len;
 	struct rf_2a4m1_rxinfo info;
+	u32 rxinfo;
 	int ret;
 
 	ret = rf_2a4m1_mt7601u_usb_rx_unwrap(seg, seg_len,
@@ -1638,6 +1647,8 @@ static void rf_2a4m1_rx_process_seg(struct rf_2a4m1_dev *dev,
 					     &payload, &payload_len);
 	if (ret != RF_2A4M1_S8021X_OK)
 		return;
+
+	rxinfo = rf_2a4m1_get_le32(rxwi + RF_2A4M1_MT_RXWI_OFF_RXINFO);
 
 	if (rf_2a4m1_mt7601u_parse_rxwi(rxwi, rxwi_len, payload, payload_len,
 					&info) == RF_2A4M1_S8021X_OK) {
@@ -1657,12 +1668,102 @@ static void rf_2a4m1_rx_process_seg(struct rf_2a4m1_dev *dev,
 			flen -= fcs_len;
 
 		/*
+		 * Remove the hardware's L2 padding.
+		 *
+		 * The MAC 4-byte-aligns the payload that follows the 802.11
+		 * header, so when the header is not a multiple of 4 it inserts 2
+		 * bytes BETWEEN the header and the LLC/SNAP and flags it with
+		 * MT_RXINFO_L2PAD. Management frames have a 24-byte header and
+		 * are already aligned, so they are never padded -- but a QoS DATA
+		 * header is 26 bytes and always is. Leave the pad in and every
+		 * QoS data frame decodes two bytes off: the EAPOL-Key M1 that
+		 * opens the 4-way is a QoS data frame, so the handshake silently
+		 * never starts while beacons/auth/assoc all parse perfectly.
+		 * Shift the header up over the pad (as the in-tree driver's
+		 * mt76_remove_hdr_pad does) so header and payload are adjacent.
+		 */
+		if ((rxinfo & MT_RXINFO_L2PAD) && info.data && flen >= 2) {
+			u8 *d = (u8 *)info.data;
+			unsigned int hl;
+			u16 fc = (u16)(d[0] | ((u16)d[1] << 8));
+
+			hl = ieee80211_hdrlen((__force __le16)fc);
+			if (flen > hl + 2 && info.len > 2) {
+				memmove(d + 2, d, hl);
+				info.data = d + 2;
+				flen -= 2;
+				/*
+				 * The core reads info.len, not the local flen.
+				 * Advancing info.data by 2 without shortening
+				 * info.len would run the core's parse 2 bytes
+				 * past the payload, so keep the two consistent.
+				 *
+				 * Deliberately adjusted RELATIVE to what
+				 * parse_rxwi set rather than replaced with flen:
+				 * flen additionally subtracts a 4-byte FCS, and
+				 * imposing that on the core reproducibly broke
+				 * mgmt parsing (the SME rejected every
+				 * probe-response and never left SCANNING), so
+				 * that assumption is unproven and is left alone
+				 * here.
+				 */
+				info.len -= 2;
+			}
+		}
+
+		/*
 		 * DATA frames (cleartext, or CCMP-decrypted with the installed
 		 * pairwise TK) are bridged to the stack here; mgmt/control, the
 		 * 4-way EAPOL, and pre-key Protected frames fall through to the
 		 * core (SME) path.
 		 */
 		atomic_inc(&dev->rx_frames);
+
+		/*
+		 * EAPOL-Key (the 4-way) rides a DATA frame behind LLC/SNAP, so
+		 * count it here where every frame passes -- the mgmt histogram
+		 * cannot see it, and "no M1 arrived" vs "M1 arrived and was
+		 * ignored" are opposite bugs.
+		 */
+		if (flen >= 2 && info.data) {
+			u16 fc0 = (u16)(info.data[0] | ((u16)info.data[1] << 8));
+
+			/*
+			 * Histogram by 802.11 TYPE (0=mgmt 1=ctrl 2=data), and
+			 * separately count data frames addressed to US. "We hear
+			 * no data at all" and "we hear data but the AP never sent
+			 * M1" are opposite root causes and the mgmt histogram
+			 * cannot distinguish them.
+			 */
+			atomic_inc(&dev->rx_type[(fc0 >> 2) & 3]);
+
+			if (((fc0 >> 2) & 3) == 2 && flen >= 32) {
+				unsigned int hl = ieee80211_hdrlen((__force __le16)fc0);
+
+				/* addr1 (RA) is at offset 4 for every frame. */
+				if (ether_addr_equal(info.data + 4, dev->macaddr.a)) {
+					atomic_inc(&dev->rx_data_to_us);
+					/*
+					 * Dump it. A data frame addressed to us
+					 * during the 4-way is almost certainly M1;
+					 * if it is not being recognised, the raw
+					 * bytes say why (wrong header length, a
+					 * Protected bit we did not expect, an
+					 * unexpected LLC) where a counter cannot.
+					 */
+					if (atomic_inc_return(&dev->rx_d2u_logged) <= 6)
+						dev_info(dev->dev,
+							 "rx DATA to us: fc=0x%04x hdrlen=%u prot=%d len=%u body=%*ph\n",
+							 fc0, hl,
+							 !!(fc0 & 0x4000), flen,
+							 (int)min_t(unsigned int, 16u, flen - hl),
+							 info.data + hl);
+				}
+				if (flen >= hl + 8 &&
+				    get_unaligned_be16(info.data + hl + 6) == 0x888e)
+					atomic_inc(&dev->rx_eapol);
+			}
+		}
 
 		if (flen >= 2 && info.data) {
 			u16 fc = (u16)(info.data[0] | ((u16)info.data[1] << 8));
@@ -1671,6 +1772,34 @@ static void rf_2a4m1_rx_process_seg(struct rf_2a4m1_dev *dev,
 				u8 sub = (fc >> 4) & 0xf;
 
 				atomic_inc(&dev->rx_mgmt_sub[sub]);
+				/*
+				 * The AP's VERDICT on us, in its own words. A
+				 * counted assoc-response says only that the AP
+				 * replied -- not that it said yes; and a deauth's
+				 * reason code names exactly why it threw us off
+				 * (e.g. 15 = 4-way timeout). Without these two
+				 * fields "associated" is an assumption.
+				 * Mgmt body starts at 24: assoc-resp is
+				 * cap(2) status(2) aid(2); deauth is reason(2).
+				 */
+				if (sub == 1 && flen >= 30)
+					dev_info(dev->dev,
+						 "rx assoc-resp: status=%u aid=0x%04x from %pM\n",
+						 get_unaligned_le16(info.data + 26),
+						 get_unaligned_le16(info.data + 28),
+						 info.data + 10);
+				else if (sub == 12 && flen >= 26)
+					dev_info(dev->dev,
+						 "rx DEAUTH: reason=%u from %pM\n",
+						 get_unaligned_le16(info.data + 24),
+						 info.data + 10);
+				else if (sub == 11 && flen >= 30)
+					dev_info(dev->dev,
+						 "rx auth: alg=%u seq=%u status=%u from %pM\n",
+						 get_unaligned_le16(info.data + 24),
+						 get_unaligned_le16(info.data + 26),
+						 get_unaligned_le16(info.data + 28),
+						 info.data + 10);
 				/* Was it the AP we were actually asked to join?
 				 * SA = addr2, at offset 10 of the mgmt header. */
 				if (flen >= 16 &&

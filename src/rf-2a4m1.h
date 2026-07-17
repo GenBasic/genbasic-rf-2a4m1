@@ -42,7 +42,13 @@
 
 /* Connect-completion poll (glue-side up-call driver; see cfg80211.c). */
 #define RF_2A4M1_CONNECT_POLL_MS	50
-#define RF_2A4M1_CONNECT_MAX_POLLS	60	/* ~3 s to reach CONNECTED */
+/*
+ * ~10 s. The window must outlast the WHOLE ladder -- scan, auth, assoc, then
+ * the AP's own M1 (which some APs delay well past association) and the 4-way.
+ * At 3 s a real AP's association alone could consume the budget, so a timeout
+ * reported "stalled at ASSOCED" when the exchange had simply not finished.
+ */
+#define RF_2A4M1_CONNECT_MAX_POLLS	200
 
 /* RX URB ring depth (bulk-IN pipeline). */
 #define RF_2A4M1_RX_URBS	4
@@ -182,6 +188,16 @@ struct rf_2a4m1_dev {
 	atomic_t		rx_urb_errs;	/* completions with status != 0     */
 	atomic_t		rx_urb_last_err;/* the last such status (-errno)    */
 	atomic_t		rx_bcn_logged;	/* bounds the per-beacon source log */
+	/*
+	 * EAPOL-Key frames seen on the wire. The 4-way rides DATA frames, so the
+	 * mgmt-subtype histogram is blind to it: without this, "the AP never sent
+	 * M1" and "M1 arrived and the core ignored it" look identical.
+	 */
+	atomic_t		rx_eapol;
+	atomic_t		rx_type[4];	/* 0=mgmt 1=ctrl 2=data 3=ext  */
+	atomic_t		rx_data_to_us;	/* data frames with RA == our MAC */
+	atomic_t		rx_d2u_logged;	/* bounds the data-to-us dump      */
+	u8			connect_last_state;	/* FSM step tracing */
 	/* Mgmt frames by 802.11 subtype: 8=beacon 5=probe-resp 11=auth
 	 * 1=assoc-resp. The SME leaves SCANNING only on a PROBE_RESP and has no
 	 * beacon frame type at all, so this separates "the AP never answered our

@@ -212,6 +212,21 @@ static void rf_2a4m1_connect_worker(struct work_struct *w)
 	if (dev->state == RF_2A4M1_STATE_REMOVING || !dev->connect_pending)
 		return;
 
+	/*
+	 * Trace every FSM step. The end-of-run state alone cannot separate "the
+	 * ladder stopped here" from "the ladder never got here before the poll
+	 * window closed" -- and those need opposite fixes.
+	 */
+	if (dev->sme.state != dev->connect_last_state) {
+		dev_info(dev->dev,
+			 "connect: sme.state %u -> %u at %u ms (eapol_rx=%d ptk=%d gtk=%d)\n",
+			 dev->connect_last_state, dev->sme.state,
+			 dev->connect_polls * RF_2A4M1_CONNECT_POLL_MS,
+			 atomic_read(&dev->rx_eapol),
+			 dev->sme.ptk_installed, dev->sme.gtk_installed);
+		dev->connect_last_state = dev->sme.state;
+	}
+
 	if (dev->sme.state == RF_2A4M1_SME_CONNECTED || dev->sme.connected) {
 		dev->connect_pending = false;
 		cfg80211_connect_result(dev->ndev, dev->connect_bssid, NULL, 0,
@@ -263,6 +278,13 @@ static void rf_2a4m1_connect_worker(struct work_struct *w)
 		 * threw away; urb_errs>0 means the ring is being dismantled one
 		 * URB at a time (RF_2A4M1_RX_URBS of them and RX is dead).
 		 */
+		dev_info(dev->dev,
+			 "connect: rx by type: mgmt=%d ctrl=%d data=%d (data_to_us=%d eapol_rx=%d) -- data=0 means the MAC is not admitting data frames; data>0 with eapol_rx=0 means the AP never sent M1\n",
+			 atomic_read(&dev->rx_type[0]),
+			 atomic_read(&dev->rx_type[1]),
+			 atomic_read(&dev->rx_type[2]),
+			 atomic_read(&dev->rx_data_to_us),
+			 atomic_read(&dev->rx_eapol));
 		dev_info(dev->dev,
 			 "connect: rx ring: segs=%d seg_max=%d urb_errs=%d last_err=%d (urbs=%d frames=%d of %d urbs x %d B)\n",
 			 atomic_read(&dev->rx_segs), atomic_read(&dev->rx_seg_max),
