@@ -197,6 +197,82 @@ static const struct net_device_ops rf_2a4m1_netdev_ops = {
 	.ndo_set_mac_address = eth_mac_addr,
 };
 
+/*
+ * Publish the connect target's BSS to cfg80211 and return a REFERENCED
+ * struct cfg80211_bss for it. The caller hands that reference straight to
+ * cfg80211_connect_bss(), which consumes it -- so this must NOT be paired with
+ * a cfg80211_put_bss() on the success path.
+ *
+ * Why it exists: cfg80211 warns on a successful connect result for a BSS it was
+ * never told about (net/wireless/sme.c looks the AP up by BSSID + SSID and warns
+ * if it is absent). A FullMAC driver is expected to announce the AP first -- via
+ * a scan or an inform_bss. This driver has no scan (the .scan op is an
+ * unimplemented seam), so it announces the AP here, at connect completion:
+ *
+ *  - Faithful path: if the RX worker overheard the target's beacon or
+ *    probe-response, hand cfg80211 that raw frame + its signal. cfg80211 then
+ *    parses the AP's own IEs (SSID, RSN, supported rates, HT) -- exactly what
+ *    user space (NetworkManager / wpa_supplicant) reads back off the BSS.
+ *  - Fallback: build a minimal BSS (BSSID + SSID IE + ESS/Privacy
+ *    capability) from the connect request when no frame was captured.
+ *
+ * Returns NULL only if a channel cannot be resolved or the inform allocation
+ * fails; the caller then falls back to a bssid-only result.
+ */
+static struct cfg80211_bss *rf_2a4m1_publish_target_bss(struct rf_2a4m1_dev *dev)
+{
+	struct ieee80211_channel *chan = dev->connect_chan;
+	struct cfg80211_bss *bss = NULL;
+	u8 frame[sizeof(dev->bss_frame)];
+	u8 ie[2 + IEEE80211_MAX_SSID_LEN];
+	u16 frame_len;
+	size_t ielen;
+	s8 rssi;
+
+	/* The connect request usually carries the channel; if not, derive it
+	 * from the channel the chip is actually tuned to. */
+	if (!chan && dev->cur_channel)
+		chan = ieee80211_get_channel(dev->wiphy,
+			ieee80211_channel_to_frequency(dev->cur_channel,
+						       NL80211_BAND_2GHZ));
+	if (!chan)
+		return NULL;		/* cannot inform cfg80211 without a channel */
+
+	/* Snapshot whatever the RX worker captured, under the lock. */
+	spin_lock(&dev->bss_frame_lock);
+	frame_len = dev->bss_frame_len;
+	rssi = dev->bss_frame_rssi;
+	if (frame_len && frame_len <= sizeof(frame))
+		memcpy(frame, dev->bss_frame, frame_len);
+	else
+		frame_len = 0;
+	spin_unlock(&dev->bss_frame_lock);
+
+	/* Signal is mBm when the wiphy's signal type is CFG80211_SIGNAL_TYPE_MBM
+	 * (set in rf_2a4m1_wiphy_alloc): dBm * 100. */
+	if (frame_len) {
+		bss = cfg80211_inform_bss_frame(dev->wiphy, chan,
+						(struct ieee80211_mgmt *)frame,
+						frame_len, (s32)rssi * 100,
+						GFP_KERNEL);
+		if (bss)
+			return bss;	/* faithful path succeeded */
+		/* else: inform failed -- fall through to the constructed BSS */
+	}
+
+	ie[0] = WLAN_EID_SSID;
+	ie[1] = dev->connect_ssid_len;
+	if (dev->connect_ssid_len)
+		memcpy(ie + 2, dev->connect_ssid, dev->connect_ssid_len);
+	ielen = 2 + dev->connect_ssid_len;
+
+	return cfg80211_inform_bss(dev->wiphy, chan, CFG80211_BSS_FTYPE_UNKNOWN,
+				   dev->connect_bssid, 0,
+				   WLAN_CAPABILITY_ESS | WLAN_CAPABILITY_PRIVACY,
+				   100 /* beacon interval (TU) */,
+				   ie, ielen, (s32)rssi * 100, GFP_KERNEL);
+}
+
 /* ================================================================== */
 /* Connect-completion: the core advances the connect FSM as    */
 /* the AP's frames arrive (via the HAL RX -> sme_rx path); it has no    */
@@ -224,13 +300,31 @@ static void rf_2a4m1_connect_worker(struct work_struct *w)
 			 dev->connect_polls * RF_2A4M1_CONNECT_POLL_MS,
 			 atomic_read(&dev->rx_eapol),
 			 dev->sme.ptk_installed, dev->sme.gtk_installed);
+		dev_info(dev->dev,
+			 "connect: 4-way stages: m1_rx=%u m2_tx=%u m3_rx=%u m4_tx=%u bad_mic=%u ocv_fail=%u\n",
+			 dev->sme.eapol_m1_rx, dev->sme.eapol_m2_tx,
+			 dev->sme.eapol_m3_rx, dev->sme.eapol_m4_tx,
+			 dev->sme.bad_mic, dev->sme.ocv_fail);
 		dev->connect_last_state = dev->sme.state;
 	}
 
 	if (dev->sme.state == RF_2A4M1_SME_CONNECTED || dev->sme.connected) {
+		struct cfg80211_bss *bss;
+
 		dev->connect_pending = false;
-		cfg80211_connect_result(dev->ndev, dev->connect_bssid, NULL, 0,
-					NULL, 0, WLAN_STATUS_SUCCESS, GFP_KERNEL);
+		/*
+		 * Publish the AP's BSS to cfg80211 BEFORE reporting success and
+		 * pass the referenced bss straight into cfg80211_connect_bss(),
+		 * which consumes the reference (so it is NOT put here). With the
+		 * bss supplied, cfg80211 skips its own BSSID+SSID lookup and the
+		 * bss_not_found WARN (net/wireless/sme.c) it would otherwise hit.
+		 * bss == NULL only on OOM: the call then degrades to a bssid-only
+		 * result (the pre-fix behaviour), which is the right failure mode.
+		 */
+		bss = rf_2a4m1_publish_target_bss(dev);
+		cfg80211_connect_bss(dev->ndev, dev->connect_bssid, bss, NULL, 0,
+				     NULL, 0, WLAN_STATUS_SUCCESS, GFP_KERNEL,
+				     NL80211_TIMEOUT_UNSPECIFIED);
 		return;
 	}
 	if (dev->sme.state == RF_2A4M1_SME_FAILED) {
@@ -273,6 +367,11 @@ static void rf_2a4m1_connect_worker(struct work_struct *w)
 		dev_info(dev->dev,
 			 "connect: tx_calls=%d last_mpdu_len=%d (a valid 802.11 mgmt frame is >=24 B of header alone)\n",
 			 atomic_read(&dev->tx_calls), atomic_read(&dev->tx_last_len));
+		dev_info(dev->dev,
+			 "connect: 4-way stages (final): m1_rx=%u m2_tx=%u m3_rx=%u m4_tx=%u bad_mic=%u ocv_fail=%u\n",
+			 dev->sme.eapol_m1_rx, dev->sme.eapol_m2_tx,
+			 dev->sme.eapol_m3_rx, dev->sme.eapol_m4_tx,
+			 dev->sme.bad_mic, dev->sme.ocv_fail);
 		/*
 		 * The ring itself. segs>frames means the chip delivered frames we
 		 * threw away; urb_errs>0 means the ring is being dismantled one
@@ -431,6 +530,23 @@ static int rf_2a4m1_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 
 	memcpy(dev->connect_bssid, conn->bssid, RF_2A4M1_ETH_ALEN);
 	dev->connect_polls = 0;
+
+	/*
+	 * Remember the target's SSID + channel so the completion can publish its
+	 * BSS to cfg80211 (cfg80211 matches the BSS on BSSID + SSID), and clear
+	 * any beacon captured for a previous connect so the RX worker starts this
+	 * one fresh. Do this before arming connect_pending, which gates capture.
+	 */
+	dev->connect_ssid_len = min_t(size_t, conn->ssid_len,
+				      sizeof(dev->connect_ssid));
+	if (conn->ssid && dev->connect_ssid_len)
+		memcpy(dev->connect_ssid, conn->ssid, dev->connect_ssid_len);
+	dev->connect_chan = conn->channel;
+	spin_lock(&dev->bss_frame_lock);
+	dev->bss_frame_len = 0;
+	dev->bss_frame_rssi = -60;	/* placeholder until a target beacon is heard */
+	spin_unlock(&dev->bss_frame_lock);
+
 	dev->connect_pending = true;
 	schedule_delayed_work(&dev->connect_work,
 			      msecs_to_jiffies(RF_2A4M1_CONNECT_POLL_MS));
@@ -566,6 +682,7 @@ int rf_2a4m1_cfg80211_register(struct rf_2a4m1_dev *dev)
 
 	rf_2a4m1_set_wiphy_dev(dev->wiphy, dev);
 
+	spin_lock_init(&dev->bss_frame_lock);
 	INIT_DELAYED_WORK(&dev->connect_work, rf_2a4m1_connect_worker);
 
 	ret = wiphy_register(dev->wiphy);

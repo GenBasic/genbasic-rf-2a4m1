@@ -1811,6 +1811,29 @@ static void rf_2a4m1_rx_process_seg(struct rf_2a4m1_dev *dev,
 						atomic_inc(&dev->rx_auth_target);
 				}
 				/*
+				 * Capture the connect target's beacon (8) /
+				 * probe-response (5) so the connect completion can
+				 * publish its BSS to cfg80211 with the AP's real IEs
+				 * before reporting success -- a FullMAC driver must
+				 * announce the AP (a scan or an inform_bss) first, or
+				 * cfg80211 warns. Record the signal on every match and
+				 * the raw frame whenever it fits the fixed buffer.
+				 */
+				if ((sub == 8 || sub == 5) &&
+				    dev->connect_pending && flen >= 16 &&
+				    ether_addr_equal(info.data + 10,
+						     dev->connect_bssid)) {
+					spin_lock(&dev->bss_frame_lock);
+					dev->bss_frame_rssi = info.rssi;
+					if (flen >= 36 &&
+					    flen <= sizeof(dev->bss_frame)) {
+						memcpy(dev->bss_frame,
+						       info.data, flen);
+						dev->bss_frame_len = flen;
+					}
+					spin_unlock(&dev->bss_frame_lock);
+				}
+				/*
 				 * Beacon / probe-response detail, incl. RSSI --
 				 * dev_dbg, not dev_info: in a busy 2.4 GHz cell
 				 * this fires many times per second. Enable via

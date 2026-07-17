@@ -17,6 +17,7 @@
 
 #include <linux/types.h>
 #include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include <linux/usb.h>
 #include <linux/workqueue.h>
 #include <net/cfg80211.h>
@@ -160,6 +161,31 @@ struct rf_2a4m1_dev {
 	u8			connect_bssid[RF_2A4M1_ETH_ALEN];
 	unsigned int		connect_polls;
 	bool			connect_pending;
+
+	/*
+	 * Connect target's SSID + channel, captured from the connect request so
+	 * the connect worker can publish the AP's BSS to cfg80211 BEFORE it
+	 * reports a successful result. cfg80211 warns on a successful connect
+	 * for a BSS it was never told about (net/wireless/sme.c), and it matches
+	 * that BSS on BSSID + SSID -- so both must be on hand at completion time.
+	 */
+	u8			connect_ssid[IEEE80211_MAX_SSID_LEN];
+	u8			connect_ssid_len;
+	struct ieee80211_channel *connect_chan;
+
+	/*
+	 * Latest beacon / probe-response overheard FROM the connect target, so
+	 * the completion can inform cfg80211 with the AP's own IEs (the faithful
+	 * cfg80211_inform_bss_frame path) instead of a constructed stub. Written
+	 * by the RX worker, read by the connect worker -- two work items that can
+	 * run on different CPUs, so the spinlock makes the hand-off race-free.
+	 * A fixed buffer (no allocation lifecycle to leak): a frame that does not
+	 * fit is simply not captured and the worker builds a minimal BSS.
+	 */
+	spinlock_t		bss_frame_lock;
+	u16			bss_frame_len;	/* 0 = none captured */
+	s8			bss_frame_rssi;	/* dBm, as the RXWI delivered it */
+	u8			bss_frame[512];
 
 	/*
 	 * RX instrumentation. ndev->stats.rx_packets only counts DATA frames
