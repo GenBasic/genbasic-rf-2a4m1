@@ -1480,18 +1480,30 @@ static bool rf_2a4m1_rx_to_netdev(struct rf_2a4m1_dev *dev,
 		 */
 		if (hw_decrypted) {
 			/*
-			 * The chip verified + stripped the trailing MIC/ICV, but
-			 * leaves the 8-octet CCMP header (ExtIV/PN) in place between
-			 * the 802.11 header and the LLC/SNAP (mainline mt7601u sets
-			 * RX_FLAG_MIC/ICV_STRIPPED but NOT IV_STRIPPED -- the IV rides
-			 * in the delivered frame).  Skip it to reach the plaintext.
+			 * The chip verified the AES-CCM MIC and stripped the trailing
+			 * MIC/ICV.  Whether it ALSO stripped the 8-octet CCMP header
+			 * (IV/PN) is not fixed: mainline mt7601u (mac.c
+			 * mt76_mac_process_rx) sets RX_FLAG_IV_STRIPPED on DECRYPT and
+			 * clears it again only when the RXWI MT_RXINFO_PN_LEN field is
+			 * non-zero.  So the plaintext LLC/SNAP sits EITHER immediately
+			 * after the 802.11 header (IV stripped) OR 8 octets in (CCMP
+			 * header retained).  Rather than hard-code one offset -- a wrong
+			 * guess feeds the deframe garbage, the SNAP check below fails,
+			 * and the frame is silently punted to the core (SME) path, which
+			 * drops every data frame and stalls the whole L3 datapath --
+			 * locate the plaintext by the RFC1042 LLC/SNAP signature, which
+			 * is correct in both cases.
 			 */
-			const unsigned int ccmp_hdr = 8;
-
-			if (len < hdrlen + ccmp_hdr)
+			if (len < hdrlen)
 				return false;
-			body     = data + hdrlen + ccmp_hdr;
-			body_len = len - hdrlen - ccmp_hdr;
+			body     = data + hdrlen;
+			body_len = len - hdrlen;
+			if (body_len >= 8 + 3 &&
+			    !(body[0] == 0xaa && body[1] == 0xaa && body[2] == 0x03) &&
+			    body[8] == 0xaa && body[9] == 0xaa && body[10] == 0x03) {
+				body     += 8;	/* CCMP header retained -> skip it */
+				body_len -= 8;
+			}
 		} else {
 			int r;
 
@@ -1532,6 +1544,23 @@ static bool rf_2a4m1_rx_to_netdev(struct rf_2a4m1_dev *dev,
 	if (snap[0] != 0xaa || snap[1] != 0xaa || snap[2] != 0x03)
 		goto to_core;			/* non-SNAP data -> core path */
 	ethertype = ((u16)snap[6] << 8) | snap[7];
+
+	/* DIAG: bounded log of every deframed data frame -- ethertype (0x0800 =
+	 * IPv4 -> a DHCP OFFER lives here), DA class (bcast/mcast/ucast), and the
+	 * HW-decrypt verdict, so an L3 stall can be pinned to "no OFFER arrived" vs
+	 * "OFFER arrived and was mis-deframed". */
+	{
+		static atomic_t diag_n = ATOMIC_INIT(0);
+
+		if (atomic_inc_return(&diag_n) <= 40)
+			dev_info(dev->dev,
+				 "rxdiag deframe: ethertype=0x%04x da=%pM %s prot=%d hwdec=%d bodylen=%u snap8=%*ph\n",
+				 ethertype, ieee80211_get_DA(hdr),
+				 is_broadcast_ether_addr(ieee80211_get_DA(hdr)) ? "BCAST" :
+				 is_multicast_ether_addr(ieee80211_get_DA(hdr)) ? "MCAST" : "ucast",
+				 ieee80211_has_protected(fc), hw_decrypted, body_len,
+				 (int)min_t(unsigned int, 12u, body_len), snap);
+	}
 
 	/*
 	 * The 4-way EAPOL is a DATA frame too (ethertype 0x888E); it MUST stay on
@@ -1800,6 +1829,25 @@ static void rf_2a4m1_rx_process_seg(struct rf_2a4m1_dev *dev,
 							 "rx DATA to us: fc=0x%04x hdrlen=%u prot=%d len=%u body=%*ph\n",
 							 fc0, hl,
 							 !!(fc0 & 0x4000), flen,
+							 (int)min_t(unsigned int, 16u, flen - hl),
+							 info.data + hl);
+				} else if (info.data[4] & 0x01) {
+					/*
+					 * DIAG: GROUP-addressed (bcast/mcast) data frame --
+					 * a broadcast DHCP OFFER to an IP-less client lands
+					 * here. Log the HW-decrypt verdict (DECRYPT set? MIC
+					 * err?) + the body bytes so a stall can be pinned to
+					 * "the OFFER arrived group-encrypted and the GTK/SKEY
+					 * path did not decrypt it" (multicast=0 at netdev).
+					 */
+					static atomic_t grp_n = ATOMIC_INIT(0);
+
+					if (atomic_inc_return(&grp_n) <= 20)
+						dev_info(dev->dev,
+							 "rx GROUP data: da=%pM fc=0x%04x prot=%d rxinfo=0x%08x DECRYPT=%d MICERR=%d body=%*ph\n",
+							 info.data + 4, fc0, !!(fc0 & 0x4000),
+							 rxinfo, !!(rxinfo & MT_RXINFO_DECRYPT),
+							 !!(rxinfo & (MT_RXINFO_ICVERR | MT_RXINFO_MICERR)),
 							 (int)min_t(unsigned int, 16u, flen - hl),
 							 info.data + hl);
 				}
@@ -2146,6 +2194,21 @@ int rf_2a4m1_usb_hw_data_tx(struct rf_2a4m1_dev *dev, const u8 *eth,
 		dev_info(dev->dev,
 			 "hwcrypto: first HW-CCMP data frame TX'd (%u B plaintext MPDU, FC.Protected=1, wcid=%u, WIV=0 -> chip encrypts)\n",
 			 (unsigned int)o, dev->hw_wcid);
+	/* DIAG: bounded per-frame TX log -- ethertype (0x0800 = the DHCP DISCOVER),
+	 * DA (bcast for DISCOVER), length, and the tx return code, so an L3 stall
+	 * can be pinned to "the DISCOVER never radiated" vs "it radiated + the AP
+	 * did not answer". */
+	{
+		static atomic_t tx_diag_n = ATOMIC_INIT(0);
+
+		if (atomic_inc_return(&tx_diag_n) <= 16)
+			dev_info(dev->dev,
+				 "txdiag: ethertype=0x%04x da=%pM %s mpdu=%uB rc=%d\n",
+				 ethertype, da,
+				 is_broadcast_ether_addr(da) ? "BCAST" :
+				 is_multicast_ether_addr(da) ? "MCAST" : "ucast",
+				 (unsigned int)o, ret);
+	}
 	return ret;
 }
 
