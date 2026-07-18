@@ -1604,6 +1604,43 @@ static bool rf_2a4m1_rx_to_netdev(struct rf_2a4m1_dev *dev,
 	}
 
 	/*
+	 * DIAG: uncapped detector for an inbound DHCP server->client reply (OFFER
+	 * or ACK) -- IPv4 (0x0800) UDP with source port 67 (bootps).  This is the
+	 * decisive "did an OFFER arrive at all" datum, and it deliberately survives
+	 * the general 40-entry deframe cap above (DHCP replies are rare, so an
+	 * unbounded log here cannot flood) so it is seen across the WHOLE DHCP retry
+	 * window.  Logs the DA class (a broadcast OFFER lands here group-decrypted;
+	 * a unicast OFFER pairwise-decrypted) + the decrypt verdict, so a stall
+	 * splits "no OFFER inbound (the AP drops our DISCOVER on decrypt)" from
+	 * "OFFER arrived and was delivered (the client/route is the issue)".
+	 */
+	if (ethertype == ETH_P_IP && body_len >= 8 + 20 + 8) {
+		const u8 *ip = snap + 8;
+		unsigned int ihl = (unsigned int)(ip[0] & 0x0f) * 4;
+
+		if ((ip[0] >> 4) == 4 && ip[9] == 17 /* IPPROTO_UDP */ &&
+		    ihl >= 20 && body_len >= 8 + ihl + 8) {
+			const u8 *udp = ip + ihl;
+			u16 sport = get_unaligned_be16(udp);
+			u16 dport = get_unaligned_be16(udp + 2);
+			u16 ip_tot = get_unaligned_be16(ip + 2);	/* IP total_length */
+			u16 avail  = body_len - 8;			/* delivered after SNAP */
+
+			if (sport == 67 || dport == 68) {
+				atomic_inc(&dev->rx_dhcp_reply);
+				dev_info(dev->dev,
+					 "rxdhcp: DHCP reply IN da=%pM %s prot=%d hwdec=%d udp %u->%u ip_total_len=%u avail=%u %s -- an OFFER/ACK reached the driver\n",
+					 ieee80211_get_DA(hdr),
+					 is_broadcast_ether_addr(ieee80211_get_DA(hdr)) ? "BCAST" :
+					 is_multicast_ether_addr(ieee80211_get_DA(hdr)) ? "MCAST" : "ucast",
+					 ieee80211_has_protected(fc), hw_decrypted,
+					 sport, dport, ip_tot, avail,
+					 ip_tot <= avail ? "FULL" : "TRUNCATED");
+			}
+		}
+	}
+
+	/*
 	 * The 4-way EAPOL is a DATA frame too (ethertype 0x888E); it MUST stay on
 	 * the core path -- do NOT reroute it to the stack.  (The 4-way EAPOL is
 	 * cleartext; a Protected EAPOL is a group-rekey frame -- also left to the
@@ -1767,10 +1804,10 @@ static void rf_2a4m1_rx_process_seg(struct rf_2a4m1_dev *dev,
 	if (rf_2a4m1_mt7601u_parse_rxwi(rxwi, rxwi_len, payload, payload_len,
 					&info) == RF_2A4M1_S8021X_OK) {
 		/*
-		 * The RXWI MPDU_LEN is the true 802.11 frame length including the
-		 * 4-B FCS the MT7601U delivers in the MPDU; clamp to the unwrapped
-		 * (4-aligned) payload span and strip the trailing FCS to get the
-		 * exact frame the deframe consumes.
+		 * The RXWI MPDU_LEN is the true 802.11 frame length, excluding the
+		 * L2 pad (a DMA-alignment artifact, never counted here); clamp it to
+		 * the unwrapped (4-aligned) payload span.  It carries the trailing
+		 * FCS only for a frame the chip did NOT hardware-decrypt (see below).
 		 */
 		u16 mpdu_len = (u16)((rf_2a4m1_get_le32(rxwi + RF_2A4M1_MT_RXWI_OFF_CTL)
 				      & RF_2A4M1_MT_RXWI_CTL_MPDU_LEN_MASK)
@@ -1778,7 +1815,19 @@ static void rf_2a4m1_rx_process_seg(struct rf_2a4m1_dev *dev,
 		u16 flen = min_t(u16, mpdu_len, payload_len);
 		const u16 fcs_len = 4;		/* trailing 802.11 FCS */
 
-		if (flen > fcs_len)
+		/*
+		 * The trailing 4-B FCS is present ONLY in a frame the chip did not
+		 * hardware-decrypt.  On a HW-decrypt (RXINFO.DECRYPT) the MAC strips
+		 * the CCMP MIC *and* the FCS, and the RXWI MPDU_LEN already reports
+		 * that shorter frame -- so subtracting 4 there truncates the real
+		 * payload by 4 bytes.  That made every HW-decrypted IP datagram 4 B
+		 * shorter than its own total_length, and the stack dropped each one
+		 * (the DHCP OFFER, an ARP reply, the ICMP echo-reply) -- stalling the
+		 * whole L3 datapath -- while the cleartext 4-way, whose frames DO
+		 * carry the FCS, worked.  So strip the FCS only when NOT HW-decrypted
+		 * (a cleartext or software-CCMP frame still carries it).
+		 */
+		if (!(rxinfo & MT_RXINFO_DECRYPT) && flen > fcs_len)
 			flen -= fcs_len;
 
 		/*
@@ -1805,21 +1854,22 @@ static void rf_2a4m1_rx_process_seg(struct rf_2a4m1_dev *dev,
 			if (flen > hl + 2 && info.len > 2) {
 				memmove(d + 2, d, hl);
 				info.data = d + 2;
-				flen -= 2;
 				/*
-				 * The core reads info.len, not the local flen.
-				 * Advancing info.data by 2 without shortening
-				 * info.len would run the core's parse 2 bytes
-				 * past the payload, so keep the two consistent.
+				 * Only the BUFFER carries the 2-byte L2 pad; the RXWI
+				 * MPDU_LEN (hence flen) is the true frame length and
+				 * never counts it.  So flen must NOT be shortened here
+				 * -- doing so truncated every HW-decrypted data frame by
+				 * 2 (on top of the FCS over-strip above), the last piece
+				 * that kept the DHCP OFFER / ARP reply / ICMP echo-reply
+				 * 2 B below their own length so the stack dropped them.
+				 * The memmove slid the header up over the pad, so the
+				 * frame from info.data spans exactly flen contiguous bytes.
 				 *
-				 * Deliberately adjusted RELATIVE to what
-				 * parse_rxwi set rather than replaced with flen:
-				 * flen additionally subtracts a 4-byte FCS, and
-				 * imposing that on the core reproducibly broke
-				 * mgmt parsing (the SME rejected every
-				 * probe-response and never left SCANNING), so
-				 * that assumption is unproven and is left alone
-				 * here.
+				 * The core (SME) path reads info.len instead -- a SEPARATE
+				 * span parse_rxwi set from the padded buffer -- so it DOES
+				 * drop the 2 pad bytes (the 4-way EAPOL M1 rides that path
+				 * and needs the pad gone).  Keep the two consistent by
+				 * adjusting info.len only.
 				 */
 				info.len -= 2;
 			}

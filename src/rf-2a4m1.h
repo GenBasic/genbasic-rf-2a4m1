@@ -284,6 +284,7 @@ struct rf_2a4m1_dev {
 	atomic_t		txs_ackreq[16];		/* ACK requested, by pktid */
 	atomic_t		txs_logged;		/* bounds the per-report log */
 	atomic_t		bogus_probe_done;	/* one-shot bogus-BSSID probe */
+	atomic_t		rx_dhcp_reply;		/* inbound DHCP OFFER/ACK frames */
 };
 
 /*

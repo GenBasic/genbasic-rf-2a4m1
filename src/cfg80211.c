@@ -595,11 +595,12 @@ static int rf_2a4m1_cfg_disconnect(struct wiphy *wiphy, struct net_device *ndev,
 	 * decrypt_ok > 0 proves the RX traffic was HW-decrypted, not software CCMP.
 	 */
 	dev_info(dev->dev,
-		 "hwcrypto counters at disconnect: tx_ccmp=%d rx_protected=%d rx_decrypt_ok=%d rx_mic_err=%d\n",
+		 "hwcrypto counters at disconnect: tx_ccmp=%d rx_protected=%d rx_decrypt_ok=%d rx_mic_err=%d rx_dhcp_reply=%d\n",
 		 atomic_read(&dev->tx_data_ccmp),
 		 atomic_read(&dev->rx_data_protected),
 		 atomic_read(&dev->rx_data_decrypt_ok),
-		 atomic_read(&dev->rx_mic_err));
+		 atomic_read(&dev->rx_mic_err),
+		 atomic_read(&dev->rx_dhcp_reply));
 	/*
 	 * THE decisive line: per-class TX ACK success read from MT_TX_STAT_FIFO.
 	 * ENCRYPTED success>0 => the AP ACKs our HW-encrypted frames (wall is L3);
