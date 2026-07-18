@@ -544,6 +544,47 @@ out:
 #define MT_RX_STA_CNT0			0x1700
 #define MT_TX_STA_CNT0			0x170c
 /*
+ * MAC TX-status report FIFO (MT_TX_STAT_FIFO @ 0x1718): a 32-bit MMIO register
+ * that pops one TX-status report per read.  The MAC posts a report for every TX
+ * frame whose TXWI carries a nonzero pktid (pktid 0 => no report); reading the
+ * register returns the oldest report and consumes it, VALID clears when empty.
+ * The decisive field is SUCCESS (BIT5): the frame's unicast RA (A1) ACK'd it.
+ * Layout is the public MediaTek MT7601U hardware map (the mainline in-kernel
+ * mt7601u driver: regs.h MT_TX_STAT_FIFO_* + mac.c mt7601u_mac_fetch_tx_status).
+ */
+#define MT_TX_STAT_FIFO			0x1718
+#define MT_TXS_FIFO_VALID		BIT(0)		/* slot carries a report */
+#define MT_TXS_FIFO_PID_SHIFT		1		/* GENMASK(4,1): pktid cookie */
+#define MT_TXS_FIFO_PID_MASK		0x0000001eu
+#define MT_TXS_FIFO_SUCCESS		BIT(5)		/* frame was ACK'd */
+#define MT_TXS_FIFO_AGGR		BIT(6)		/* reported aggregated */
+#define MT_TXS_FIFO_ACKREQ		BIT(7)		/* an ACK was requested */
+#define MT_TXS_FIFO_WCID_SHIFT		8		/* GENMASK(15,8): peer/WCID slot */
+#define MT_TXS_FIFO_WCID_MASK		0x0000ff00u
+#define MT_TXS_FIFO_RATE_SHIFT		16		/* GENMASK(31,16): rate word */
+
+/*
+ * TXWI len_ctl (__le16 @ offset 6): a 12-bit MPDU byte count + a 4-bit pktid in
+ * bits 15:12.  Stamping a nonzero pktid is what makes the MAC post a TX-status
+ * report for the frame (mainline mt7601u_tx_pktid_enc).  build_txwi already
+ * stamps tp->pktid from the mt7601u len_ctl layout; the
+ * cleartext class is tagged in op_tx via rf_2a4m1_txwi_set_pktid().
+ */
+#define MT_TXWI_OFF_LEN			6
+#define MT_TXWI_LEN_PKTID_SHIFT		12
+#define MT_TXWI_LEN_PKTID_MASK		0xf000u
+
+/*
+ * TX-status correlation pktids, one per frame class, so the FIFO drain can split
+ * ACK success by class (4-bit field; 0 = no report).  CLEARTEXT is stamped in
+ * op_tx onto the WIV=1 connect mgmt/EAPOL frames; ENCRYPTED and BOGUS are set by
+ * their callers via tp->pktid.
+ */
+#define RF_2A4M1_PID_CLEARTEXT		1	/* WIV=1 connect mgmt / EAPOL       */
+#define RF_2A4M1_PID_ENCRYPTED		2	/* WIV=0 HW-CCMP data frame to AP   */
+#define RF_2A4M1_PID_BOGUS		3	/* WIV=0 frame to a bogus BSSID     */
+
+/*
  * RXWI rxinfo status word (the first word of the RXWI). BIT(14) flags the 2
  * bytes of L2 padding the MAC inserts between a non-4-byte-aligned 802.11
  * header and the payload.
@@ -2183,6 +2224,10 @@ int rf_2a4m1_usb_hw_data_tx(struct rf_2a4m1_dev *dev, const u8 *eth,
 	tp.phy_mode = RF_2A4M1_HAL_PHY_OFDM;	/* OFDM 6 Mbps -- robust */
 	tp.bw_mhz   = 20;
 	tp.n_ss     = 1;
+	/* Stamp the encrypted-class pktid so the MAC posts a TX-status report we
+	 * can read back: this is the frame whose ACK/no-ACK is the decisive datum
+	 * (does the AP receive our HW-encrypted data frame?). */
+	tp.pktid    = RF_2A4M1_PID_ENCRYPTED;
 
 	m.data = frame;
 	m.len  = (u16)o;
@@ -2212,6 +2257,191 @@ int rf_2a4m1_usb_hw_data_tx(struct rf_2a4m1_dev *dev, const u8 *eth,
 	return ret;
 }
 
+/* ================================================================== */
+/* TX-status (MT_TX_STAT_FIFO) reading -- the decisive data-plane      */
+/* measurement: does the AP ACK our frames?                           */
+/*                                                                    */
+/* rc=0 from the bulk-out is only DMA-enqueue success. To learn if a   */
+/* frame reached + was ACK'd by the AP we must read the MAC's TX-status */
+/* report FIFO. The MAC posts a report per frame stamped with a nonzero */
+/* TXWI pktid; each report carries VALID + SUCCESS(ACK'd) + ACKREQ +    */
+/* WCID + the pktid. A glue-side delayed work drains the FIFO in process */
+/* context (the vendor-control reg read sleeps) and buckets each report */
+/* by pktid, so ACK success is split per frame class:                  */
+/*   pktid 1 CLEARTEXT  -- WIV=1 connect mgmt/EAPOL (known-good control) */
+/*   pktid 2 ENCRYPTED  -- WIV=0 HW-CCMP data frame to the AP (the ask)  */
+/*   pktid 3 BOGUS      -- WIV=0 to a bogus BSSID (success MUST be 0)    */
+/* Follows the mainline mt7601u report-FIFO drain                       */
+/* (mac.c mt7601u_mac_fetch_tx_status()).                              */
+/* ================================================================== */
+
+/* Stamp a 4-bit pktid into the built TXWI's len_ctl (bits 15:12). */
+static void rf_2a4m1_txwi_set_pktid(u8 *txwi, u8 pktid)
+{
+	u16 lenctl = get_unaligned_le16(txwi + MT_TXWI_OFF_LEN);
+
+	lenctl &= ~MT_TXWI_LEN_PKTID_MASK;
+	lenctl |= ((u16)pktid << MT_TXWI_LEN_PKTID_SHIFT) & MT_TXWI_LEN_PKTID_MASK;
+	put_unaligned_le16(lenctl, txwi + MT_TXWI_OFF_LEN);
+}
+
+/*
+ * Drain the MAC TX-status report FIFO, bucketing each report by pktid.  Reading
+ * MT_TX_STAT_FIFO pops the oldest report; stop at the first slot with VALID
+ * clear (or a read error).  Process context only (reg_read is a sleeping vendor
+ * control transfer).  Bounded per call so a wedged FIFO cannot spin.
+ */
+static void rf_2a4m1_drain_tx_status(struct rf_2a4m1_dev *dev)
+{
+	int i;
+
+	for (i = 0; i < 24; i++) {
+		u32 fifo = rf_2a4m1_reg_read(dev, MT_TX_STAT_FIFO);
+		bool success, ackreq, aggr;
+		u8 pid, wcid;
+
+		if (fifo == ~0u || !(fifo & MT_TXS_FIFO_VALID))
+			break;			/* read error or empty slot */
+
+		pid     = (fifo & MT_TXS_FIFO_PID_MASK) >> MT_TXS_FIFO_PID_SHIFT;
+		wcid    = (fifo & MT_TXS_FIFO_WCID_MASK) >> MT_TXS_FIFO_WCID_SHIFT;
+		success = !!(fifo & MT_TXS_FIFO_SUCCESS);
+		ackreq  = !!(fifo & MT_TXS_FIFO_ACKREQ);
+		aggr    = !!(fifo & MT_TXS_FIFO_AGGR);
+
+		atomic_inc(&dev->txs_reports);
+		atomic_inc(&dev->txs_valid[pid]);
+		if (success)
+			atomic_inc(&dev->txs_success[pid]);
+		if (ackreq)
+			atomic_inc(&dev->txs_ackreq[pid]);
+
+		/* Verbatim per-report line, bounded. pid: 1=CLEARTEXT(WIV=1)
+		 * 2=ENCRYPTED(WIV=0 to AP) 3=BOGUS(WIV=0 to bogus BSSID). */
+		if (atomic_inc_return(&dev->txs_logged) <= 64)
+			dev_info(dev->dev,
+				 "txstat: fifo=0x%08x valid=1 success=%d ackreq=%d aggr=%d wcid=%u pid=%u rate=0x%04x\n",
+				 fifo, success, ackreq, aggr, wcid, pid,
+				 (fifo >> MT_TXS_FIFO_RATE_SHIFT) & 0xffff);
+	}
+}
+
+static void rf_2a4m1_stat_worker(struct work_struct *w)
+{
+	struct rf_2a4m1_dev *dev =
+		container_of(to_delayed_work(w), struct rf_2a4m1_dev, stat_work);
+
+	if (!dev->stat_polling || dev->state == RF_2A4M1_STATE_REMOVING)
+		return;
+	if (dev->hw_inited)
+		rf_2a4m1_drain_tx_status(dev);
+	if (dev->stat_polling)
+		schedule_delayed_work(&dev->stat_work,
+				      msecs_to_jiffies(RF_2A4M1_STAT_POLL_MS));
+}
+
+void rf_2a4m1_usb_stat_init(struct rf_2a4m1_dev *dev)
+{
+	INIT_DELAYED_WORK(&dev->stat_work, rf_2a4m1_stat_worker);
+}
+
+void rf_2a4m1_usb_stat_start(struct rf_2a4m1_dev *dev)
+{
+	if (dev->stat_polling)
+		return;
+	dev->stat_polling = true;
+	schedule_delayed_work(&dev->stat_work,
+			      msecs_to_jiffies(RF_2A4M1_STAT_POLL_MS));
+}
+
+void rf_2a4m1_usb_stat_stop(struct rf_2a4m1_dev *dev)
+{
+	dev->stat_polling = false;
+	cancel_delayed_work_sync(&dev->stat_work);
+}
+
+/* Final drain + per-class summary. The decisive line of the whole run. */
+void rf_2a4m1_usb_stat_report(struct rf_2a4m1_dev *dev)
+{
+	if (dev->hw_inited)
+		rf_2a4m1_drain_tx_status(dev);		/* sweep trailing reports */
+	dev_info(dev->dev,
+		 "txstat summary: total_reports=%d | CLEARTEXT(pid=1,WIV=1): valid=%d ackreq=%d success=%d | ENCRYPTED(pid=2,WIV=0->AP): valid=%d ackreq=%d success=%d | BOGUS(pid=3,WIV=0->bogus): valid=%d ackreq=%d success=%d\n",
+		 atomic_read(&dev->txs_reports),
+		 atomic_read(&dev->txs_valid[RF_2A4M1_PID_CLEARTEXT]),
+		 atomic_read(&dev->txs_ackreq[RF_2A4M1_PID_CLEARTEXT]),
+		 atomic_read(&dev->txs_success[RF_2A4M1_PID_CLEARTEXT]),
+		 atomic_read(&dev->txs_valid[RF_2A4M1_PID_ENCRYPTED]),
+		 atomic_read(&dev->txs_ackreq[RF_2A4M1_PID_ENCRYPTED]),
+		 atomic_read(&dev->txs_success[RF_2A4M1_PID_ENCRYPTED]),
+		 atomic_read(&dev->txs_valid[RF_2A4M1_PID_BOGUS]),
+		 atomic_read(&dev->txs_ackreq[RF_2A4M1_PID_BOGUS]),
+		 atomic_read(&dev->txs_success[RF_2A4M1_PID_BOGUS]));
+}
+
+/*
+ * Falsifiable control for the TX-status measurement.  Send a few HW-encrypted
+ * (WIV=0, wcid = pairwise slot) data frames whose RA (A1) is a bogus,
+ * locally-administered BSSID no device on the channel owns.  No receiver can
+ * ACK them, so their TX-status SUCCESS must be 0 -- which proves a SUCCESS=1 on
+ * the real path is a genuine ACK, not a stuck bit.  A falsifiable control for
+ * the ACK measurement.  One-shot; process context.
+ */
+void rf_2a4m1_usb_bogus_bssid_probe(struct rf_2a4m1_dev *dev)
+{
+	static const u8 bogus[RF_2A4M1_ETH_ALEN] = {
+		0x02, 0x00, 0x00, 0xde, 0xad, 0x01
+	};
+	struct rf_2a4m1_tx_params tp;
+	struct rf_2a4m1_mpdu m;
+	unsigned int o;
+	u8 *frame;
+	int i;
+
+	if (!dev->hw_inited || !dev->hw_key_installed)
+		return;
+	if (atomic_cmpxchg(&dev->bogus_probe_done, 0, 1) != 0)
+		return;					/* one-shot */
+
+	frame = kmalloc(32, GFP_KERNEL);
+	if (!frame)
+		return;
+	/* Minimal 802.11 Data frame, toDS + Protected: A1 = bogus RA, A2 = us,
+	 * A3 = bogus DA, + an 8-B LLC/SNAP shim (no payload).  The chip encrypts
+	 * under the pairwise key (TXWI.wcid = hw slot, WIV=0) regardless of A1. */
+	frame[0] = 0x08;			/* Data, subtype 0 */
+	frame[1] = 0x01 | 0x40;			/* toDS + Protected */
+	frame[2] = 0; frame[3] = 0;
+	ether_addr_copy(frame + 4,  bogus);		/* A1 = RA = bogus  */
+	ether_addr_copy(frame + 10, dev->macaddr.a);	/* A2 = TA = us     */
+	ether_addr_copy(frame + 16, bogus);		/* A3 = DA = bogus  */
+	put_unaligned_le16((u16)(dev->data_seq++ << 4), frame + 22);
+	o = 24;
+	frame[o++] = 0xaa; frame[o++] = 0xaa; frame[o++] = 0x03;
+	frame[o++] = 0x00; frame[o++] = 0x00; frame[o++] = 0x00;
+	frame[o++] = 0x08; frame[o++] = 0x00;	/* ethertype IPv4 (arbitrary) */
+
+	memset(&tp, 0, sizeof(tp));
+	tp.wcid     = dev->hw_wcid;
+	tp.key_slot = dev->hw_wcid;		/* != 0xff => WIV=0 => chip encrypts */
+	tp.ac       = 1;			/* AC_BE */
+	tp.gen      = RF_2A4M1_HAL_GEN_LEGACY;
+	tp.phy_mode = RF_2A4M1_HAL_PHY_OFDM;
+	tp.bw_mhz   = 20;
+	tp.n_ss     = 1;
+	tp.pktid    = RF_2A4M1_PID_BOGUS;
+
+	m.data = frame;
+	m.len  = (u16)o;
+	m.cap  = (u16)o;
+	for (i = 0; i < 4; i++)			/* a few, so one loss is not the result */
+		dev->hal.ops->tx(&dev->hal, &m, &tp);
+	kfree(frame);
+	dev_info(dev->dev,
+		 "txstat: bogus-BSSID control -- sent 4x HW-encrypted frames to %pM (pktid=%u); TX-status SUCCESS must be 0\n",
+		 bogus, RF_2A4M1_PID_BOGUS);
+}
+
 static int rf_2a4m1_op_start(struct rf_2a4m1_hal *h,
 			     const struct rf_2a4m1_hal_cfg *cfg)
 {
@@ -2226,6 +2456,10 @@ static int rf_2a4m1_op_start(struct rf_2a4m1_hal *h,
 	 */
 	if (dev->hw_inited)
 		rf_2a4m1_mac_start_rx(dev);
+	/* Start draining the TX-status FIFO now, before the connect frames go
+	 * out, so cleartext connect/EAPOL ACKs are captured alongside the later
+	 * encrypted data-frame ACKs. */
+	rf_2a4m1_usb_stat_start(dev);
 	return rf_2a4m1_usb_rx_start(dev);
 }
 
@@ -2233,6 +2467,7 @@ static void rf_2a4m1_op_stop(struct rf_2a4m1_hal *h)
 {
 	struct rf_2a4m1_dev *dev = h->priv;
 
+	rf_2a4m1_usb_stat_stop(dev);
 	rf_2a4m1_usb_rx_stop(dev);
 }
 
@@ -2266,6 +2501,20 @@ static int rf_2a4m1_op_tx(struct rf_2a4m1_hal *h, struct rf_2a4m1_mpdu *m,
 	ret = rf_2a4m1_mt7601u_build_txwi(txwi, tp, m);
 	if (ret != RF_2A4M1_S8021X_OK)
 		return -EINVAL;
+
+	/*
+	 * TX-status correlation: the MAC only posts a report to MT_TX_STAT_FIFO
+	 * for a frame whose TXWI pktid is nonzero.  The encrypted (WIV=0) and
+	 * bogus classes carry their pktid via tp->pktid (already stamped by
+	 * build_txwi above); tag the remaining cleartext (WIV=1) class -- the
+	 * connect mgmt/EAPOL frames the core sends with tp->pktid == 0 -- so its
+	 * ACK success is measured too.  The stat_work drain buckets by this pktid.
+	 * pktid lives in the TXWI (a host<->chip descriptor); it never goes on air,
+	 * so the frame the AP sees is unchanged.
+	 */
+	if (tp->pktid == 0)
+		rf_2a4m1_txwi_set_pktid(txwi, wiv ? RF_2A4M1_PID_CLEARTEXT :
+						   RF_2A4M1_PID_ENCRYPTED);
 
 	/*
 	 * Count EVERY frame we hand the radio, and record its length. A valid

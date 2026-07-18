@@ -330,6 +330,14 @@ static void rf_2a4m1_connect_worker(struct work_struct *w)
 		if (!dev->hw_key_installed)
 			rf_2a4m1_usb_install_hw_keys(dev);
 		/*
+		 * Falsifiable control: with the HW key now installed, fire the
+		 * bogus-BSSID probe (a few HW-encrypted frames to an address no
+		 * peer owns).  Their TX-status SUCCESS must be 0, proving a
+		 * SUCCESS=1 on the real encrypted/cleartext path is a genuine ACK
+		 * and not a stuck bit.  One-shot (guarded inside).
+		 */
+		rf_2a4m1_usb_bogus_bssid_probe(dev);
+		/*
 		 * Publish the AP's BSS to cfg80211 BEFORE reporting success and
 		 * pass the referenced bss straight into cfg80211_connect_bss(),
 		 * which consumes the reference (so it is NOT put here). With the
@@ -592,6 +600,13 @@ static int rf_2a4m1_cfg_disconnect(struct wiphy *wiphy, struct net_device *ndev,
 		 atomic_read(&dev->rx_data_protected),
 		 atomic_read(&dev->rx_data_decrypt_ok),
 		 atomic_read(&dev->rx_mic_err));
+	/*
+	 * THE decisive line: per-class TX ACK success read from MT_TX_STAT_FIFO.
+	 * ENCRYPTED success>0 => the AP ACKs our HW-encrypted frames (wall is L3);
+	 * ENCRYPTED success=0 while CLEARTEXT success>0 => the HW-encrypt is the
+	 * bug; BOGUS success must be 0 for the measurement to mean anything.
+	 */
+	rf_2a4m1_usb_stat_report(dev);
 	dev->hw_key_installed = false;
 	rf_2a4m1_sme_tx_protected_deauth(&dev->sme, reason_code);
 	cfg80211_disconnected(ndev, reason_code, NULL, 0, true, GFP_KERNEL);
@@ -714,6 +729,7 @@ int rf_2a4m1_cfg80211_register(struct rf_2a4m1_dev *dev)
 
 	spin_lock_init(&dev->bss_frame_lock);
 	INIT_DELAYED_WORK(&dev->connect_work, rf_2a4m1_connect_worker);
+	rf_2a4m1_usb_stat_init(dev);
 
 	ret = wiphy_register(dev->wiphy);
 	if (ret) {
@@ -757,6 +773,7 @@ void rf_2a4m1_cfg80211_unregister(struct rf_2a4m1_dev *dev)
 {
 	dev->connect_pending = false;
 	cancel_delayed_work_sync(&dev->connect_work);
+	rf_2a4m1_usb_stat_stop(dev);
 	if (dev->ndev) {
 		unregister_netdev(dev->ndev);
 		free_netdev(dev->ndev);

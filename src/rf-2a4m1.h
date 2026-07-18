@@ -43,6 +43,11 @@
 
 /* Connect-completion poll (glue-side up-call driver; see cfg80211.c). */
 #define RF_2A4M1_CONNECT_POLL_MS	50
+
+/* TX-status FIFO drain interval (glue-side, see src/usb.c stat_work). Fast
+ * enough that the 16-deep MAC report FIFO cannot overflow between drains at the
+ * handful-of-frames-per-second data-plane rate this measurement produces. */
+#define RF_2A4M1_STAT_POLL_MS		50
 /*
  * ~10 s. The window must outlast the WHOLE ladder -- scan, auth, assoc, then
  * the AP's own M1 (which some APs delay well past association) and the 4-way.
@@ -261,6 +266,24 @@ struct rf_2a4m1_dev {
 	atomic_t		rx_data_protected;	/* Protected data frames RX'd */
 	atomic_t		rx_data_decrypt_ok;	/* HW-decrypted OK (DECRYPT set) */
 	atomic_t		rx_mic_err;		/* RXWI ICV/MIC decrypt errors */
+
+	/*
+	 * TX-status (MT_TX_STAT_FIFO) measurement.  A glue-side delayed work
+	 * drains the MAC report FIFO in process context (the reg read sleeps) and
+	 * buckets each report by the TXWI pktid we stamped, so ACK success can be
+	 * split per frame class: cleartext connect frames (pktid 1) vs HW-encrypted
+	 * data frames to the AP (pktid 2) vs a bogus-BSSID control (pktid 3).  The
+	 * decisive datum is txs_success[RF_2A4M1_PID_ENCRYPTED].  Indexed by pktid
+	 * (0..15); see src/usb.c.
+	 */
+	struct delayed_work	stat_work;
+	bool			stat_polling;
+	atomic_t		txs_reports;		/* total valid reports drained */
+	atomic_t		txs_valid[16];		/* valid reports, by pktid */
+	atomic_t		txs_success[16];	/* ACK'd (SUCCESS), by pktid */
+	atomic_t		txs_ackreq[16];		/* ACK requested, by pktid */
+	atomic_t		txs_logged;		/* bounds the per-report log */
+	atomic_t		bogus_probe_done;	/* one-shot bogus-BSSID probe */
 };
 
 /*
@@ -313,6 +336,15 @@ int rf_2a4m1_usb_install_hw_keys(struct rf_2a4m1_dev *dev);
  * out (ndo_start_xmit data path). Atomic-context safe. */
 int rf_2a4m1_usb_hw_data_tx(struct rf_2a4m1_dev *dev, const u8 *eth,
 			    unsigned int eth_len);
+
+/* TX-status (MT_TX_STAT_FIFO) measurement: init the drain work at register
+ * time, start/stop the periodic drain around the data-plane window, emit the
+ * per-class ACK-success summary, and send the bogus-BSSID falsifiable control. */
+void rf_2a4m1_usb_stat_init(struct rf_2a4m1_dev *dev);
+void rf_2a4m1_usb_stat_start(struct rf_2a4m1_dev *dev);
+void rf_2a4m1_usb_stat_stop(struct rf_2a4m1_dev *dev);
+void rf_2a4m1_usb_stat_report(struct rf_2a4m1_dev *dev);
+void rf_2a4m1_usb_bogus_bssid_probe(struct rf_2a4m1_dev *dev);
 
 /* MAC/BBP/RF chip bring-up (the register init sequence run once after the MCU
  * firmware boots; reads the EEPROM MAC into dev->macaddr + dev->ee). */
