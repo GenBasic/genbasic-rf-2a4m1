@@ -13,5 +13,5 @@ All of `src/` is GPL-2.0-only, compiled from source per-kernel by DKMS.
 | `core/` | the driver core (MAC / MLME / crypto) |
 | `compat/compat.h` | `LINUX_VERSION_CODE`-gated shims for cross-kernel builds |
 
-The `.c` sources and `core/` are added in a subsequent commit; the `Kbuild`
-object list and compile flags are already in place at the repo root.
+`Kbuild` (repo root) and `core/objects.mk` list the object set and compile
+flags; DKMS builds every `.c` here against each installed kernel.
