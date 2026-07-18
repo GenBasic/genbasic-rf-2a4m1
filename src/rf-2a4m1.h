@@ -245,6 +245,22 @@ struct rf_2a4m1_dev {
 	 */
 	atomic_t		tx_calls;	/* every frame handed to the radio */
 	atomic_t		tx_last_len;	/* length of the last MPDU radiated */
+
+	/*
+	 * HW CCMP data plane. Once the 4-way completes, the pairwise TK is
+	 * programmed into the MT7601U per-WCID key table + the GTK into the
+	 * shared-key table, so the chip HW-encrypts TX and HW-decrypts RX. The
+	 * in-driver SME runs the 4-way itself (no wpa_supplicant add_key), so
+	 * these are programmed at connect completion from dev->sme.
+	 */
+	bool			hw_key_installed;
+	u8			hw_wcid;	/* pairwise HW key slot (WCID) */
+	u8			hw_peer[RF_2A4M1_ETH_ALEN];	/* AP BSSID (RA) */
+	u16			data_seq;	/* 802.11 seqno for data TX */
+	atomic_t		tx_data_ccmp;	/* data frames HW-encrypted + TX'd */
+	atomic_t		rx_data_protected;	/* Protected data frames RX'd */
+	atomic_t		rx_data_decrypt_ok;	/* HW-decrypted OK (DECRYPT set) */
+	atomic_t		rx_mic_err;		/* RXWI ICV/MIC decrypt errors */
 };
 
 /*
@@ -289,6 +305,14 @@ int rf_2a4m1_usb_load_firmware(struct rf_2a4m1_dev *dev,
 void rf_2a4m1_usb_hal_init(struct rf_2a4m1_dev *dev);
 int rf_2a4m1_usb_rx_start(struct rf_2a4m1_dev *dev);
 void rf_2a4m1_usb_rx_stop(struct rf_2a4m1_dev *dev);
+
+/* Program the MT7601U HW crypto key table (pairwise TK + GTK + BSSID) from the
+ * completed 4-way's derived keys in dev->sme, so the chip does CCMP TX/RX. */
+int rf_2a4m1_usb_install_hw_keys(struct rf_2a4m1_dev *dev);
+/* Encapsulate an 802.3 frame as an HW-CCMP-encrypted 802.11 data frame + DMA it
+ * out (ndo_start_xmit data path). Atomic-context safe. */
+int rf_2a4m1_usb_hw_data_tx(struct rf_2a4m1_dev *dev, const u8 *eth,
+			    unsigned int eth_len);
 
 /* MAC/BBP/RF chip bring-up (the register init sequence run once after the MCU
  * firmware boots; reads the EEPROM MAC into dev->macaddr + dev->ee). */

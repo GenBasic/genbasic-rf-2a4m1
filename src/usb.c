@@ -592,6 +592,40 @@ out:
 #define MT_SKEY_MODE_BASE_0		0xb000
 #define MT_WCID_ATTR_BASE		0xa800
 
+/*
+ * HW crypto key table (mainline mt7601u regs.h / mac.c). The MT7601U CCMP engine
+ * is keyed per-WCID: with a pairwise key in slot n + the peer MAC in the address
+ * CAM, the chip auto-inserts the CCMP header (IV/EIV from its own PN) + encrypts
+ * on TX (TXWI.wcid == n, DMA WIV=0), and auto-decrypts + strips IV/MIC on RX for
+ * a Protected frame whose TA matches (RXINFO.DECRYPT). Group-addressed frames use
+ * the shared key table (MT_SKEY) indexed by (BSS, KeyID). The BSSID (MYBSS)
+ * filter is the gate the RX crypto engine needs before it does the key lookup.
+ */
+#define MT_WCID_KEY_BASE		0x8000
+#define MT_WCID_KEY(i)			(MT_WCID_KEY_BASE + (i) * 32)
+#define MT_WCID_IV_BASE			0xa000
+#define MT_WCID_IV(i)			(MT_WCID_IV_BASE + (i) * 8)
+#define MT_WCID_ATTR(i)			(MT_WCID_ATTR_BASE + (i) * 4)
+#define MT_WCID_ATTR_PAIRWISE		BIT(0)
+#define MT_WCID_ATTR_PKEY_MODE_SHIFT	1		/* GENMASK(3,1): cipher */
+#define MT_WCID_DROP_BASE		0x106c
+#define MT_WCID_DROP(i)			(MT_WCID_DROP_BASE + ((i) >> 5) * 4)
+#define MT_WCID_DROP_MASK(i)		(1u << ((i) % 32))
+#define MT_CIPHER_AES_CCMP		4
+#define MT_MAC_BSSID_DW0		0x1010
+#define MT_MAC_BSSID_DW1		0x1014
+#define MT_SKEY_BASE_0			0xac00
+#define MT_SKEY(bss, idx)		(MT_SKEY_BASE_0 + (4 * (bss) + (idx)) * 32)
+#define MT_SKEY_MODE_0(bss)		(MT_SKEY_MODE_BASE_0 + (((bss) / 2) << 2))
+#define MT_SKEY_MODE_MASK		0xfu
+#define MT_SKEY_MODE_SHIFT(bss, idx)	(4 * ((idx) + 4 * ((bss) & 1)))
+#define RF_2A4M1_HW_WCID		1	/* STA pairwise/data WCID slot */
+
+/* RXWI rxinfo (first le32) HW-decrypt status bits (mainline mt7601u mac.h). */
+#define MT_RXINFO_ICVERR		BIT(9)
+#define MT_RXINFO_MICERR		BIT(10)
+#define MT_RXINFO_DECRYPT		BIT(16)
+
 /* MCU inband command framing. */
 #define MT_MCU_MEMMAP_WLAN		0x00410000u
 #define MT_MCU_INBAND_MAX_LEN		192
@@ -1405,7 +1439,7 @@ static int rf_2a4m1_mac_start_rx(struct rf_2a4m1_dev *dev)
  * LLC/SNAP deframe done in the glue.
  */
 static bool rf_2a4m1_rx_to_netdev(struct rf_2a4m1_dev *dev,
-				  const u8 *data, u16 len)
+				  const u8 *data, u16 len, bool hw_decrypted)
 {
 	struct net_device *ndev = dev->ndev;
 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)data;
@@ -1432,49 +1466,59 @@ static bool rf_2a4m1_rx_to_netdev(struct rf_2a4m1_dev *dev,
 
 	if (ieee80211_has_protected(fc)) {
 		/*
-		 * Encrypted DATA frame: software-decrypt with the pairwise TK the
-		 * core's 4-way installed (dev->sme.installed_tk) + the per-STA PN
-		 * replay context (dev->sme.data_rx_replay), through the
-		 * core's CCMP-128 RX entry (verifies the AES-CCM MIC BEFORE the
-		 * strictly-increasing 48-bit-PN replay check).  On MIC/replay
-		 * failure the frame is dropped + accounted here; on success the
-		 * recovered plaintext body (LLC/SNAP + MSDU) flows through the same
-		 * 802.11->802.3 deframe as a cleartext frame.
-		 *
-		 * Before the 4-way installs a key (data_key_valid == false) there is
-		 * no TK, so a Protected frame is left on the core (SME) path exactly
-		 * as before -- cleartext / pre-4-way RX is unchanged.
-		 *
-		 * TODO: CCMP only (the pairwise cipher the MT7601U envelope
-		 * leads with) -- a TKIP/WEP TK would MIC-fail and drop.  The per-WCID
-		 * HW-crypto decrypt offload (h->caps.crypto_offload) is the later fast
-		 * path; this is the software route via the core.
+		 * Encrypted DATA frame. Preferred path: the chip HW-decrypted it
+		 * (RXINFO.DECRYPT set, MIC verified) under the per-WCID / shared key
+		 * table this driver programmed, and stripped the CCMP IV + MIC -- so
+		 * the payload right after the 802.11 header is already plaintext and
+		 * takes the same deframe as a cleartext frame.  Software fallback:
+		 * the chip did not decrypt (no MYBSS / key-table match), so decrypt
+		 * in software with the pairwise TK (dev->sme.installed_tk) + the
+		 * per-STA PN replay context (dev->sme.data_rx_replay) through the
+		 * core's CCMP-128 RX entry (AES-CCM MIC BEFORE the 48-bit-PN replay
+		 * check).  Before the 4-way installs a key (data_key_valid == false)
+		 * a Protected frame is left on the core (SME) path.
 		 */
-		int r;
+		if (hw_decrypted) {
+			/*
+			 * The chip verified + stripped the trailing MIC/ICV, but
+			 * leaves the 8-octet CCMP header (ExtIV/PN) in place between
+			 * the 802.11 header and the LLC/SNAP (mainline mt7601u sets
+			 * RX_FLAG_MIC/ICV_STRIPPED but NOT IV_STRIPPED -- the IV rides
+			 * in the delivered frame).  Skip it to reach the plaintext.
+			 */
+			const unsigned int ccmp_hdr = 8;
 
-		if (!dev->sme.data_key_valid)
-			return false;			/* no TK yet -> core path */
+			if (len < hdrlen + ccmp_hdr)
+				return false;
+			body     = data + hdrlen + ccmp_hdr;
+			body_len = len - hdrlen - ccmp_hdr;
+		} else {
+			int r;
 
-		decbuf = kmalloc(len, GFP_ATOMIC);
-		if (!decbuf) {
-			ndev->stats.rx_dropped++;
-			return true;			/* consumed (dropped) */
+			if (!dev->sme.data_key_valid)
+				return false;		/* no TK yet -> core path */
+
+			decbuf = kmalloc(len, GFP_ATOMIC);
+			if (!decbuf) {
+				ndev->stats.rx_dropped++;
+				return true;		/* consumed (dropped) */
+			}
+			r = rf_2a4m1_ccmp_decrypt_rx(data, len, hdrlen,
+						     dev->sme.installed_tk,
+						     decbuf, len, NULL,
+						     &dev->sme.data_rx_replay);
+			if (r < 0) {
+				dev_dbg(dev->dev, "ccmp rx drop (%s)\n",
+					r == RF_2A4M1_CCMP_RX_E_REPLAY ?
+						"replay/old PN" : "MIC/malformed");
+				ndev->stats.rx_dropped++;
+				ndev->stats.rx_errors++;
+				kfree(decbuf);
+				return true;		/* consumed (dropped) */
+			}
+			body     = decbuf;
+			body_len = (u16)r;
 		}
-		r = rf_2a4m1_ccmp_decrypt_rx(data, len, hdrlen,
-					     dev->sme.installed_tk,
-					     decbuf, len, NULL,
-					     &dev->sme.data_rx_replay);
-		if (r < 0) {
-			dev_dbg(dev->dev, "ccmp rx drop (%s)\n",
-				r == RF_2A4M1_CCMP_RX_E_REPLAY ? "replay/old PN"
-								: "MIC/malformed");
-			ndev->stats.rx_dropped++;
-			ndev->stats.rx_errors++;
-			kfree(decbuf);
-			return true;			/* consumed (dropped) */
-		}
-		body     = decbuf;
-		body_len = (u16)r;
 	} else {
 		body     = data + hdrlen;
 		body_len = len - hdrlen;
@@ -1865,8 +1909,32 @@ static void rf_2a4m1_rx_process_seg(struct rf_2a4m1_dev *dev,
 			}
 		}
 
-		if (!rf_2a4m1_rx_to_netdev(dev, info.data, flen))
-			rf_2a4m1_hal_deliver_rx(&dev->hal, &info);
+		/*
+		 * HW-decrypt status from the RXWI rxinfo word: the chip decrypted
+		 * this frame iff DECRYPT is set and neither ICV nor MIC error. Count
+		 * the encrypted data plane so the L3 round-trip can prove the traffic
+		 * was HW-crypted (not software CCMP).
+		 */
+		{
+			bool hw_dec = (rxinfo & MT_RXINFO_DECRYPT) &&
+				      !(rxinfo & (MT_RXINFO_ICVERR |
+						  MT_RXINFO_MICERR));
+
+			if (flen >= 2 && info.data &&
+			    ((info.data[0] >> 2) & 3) == 2) {	/* data frame */
+				if (info.data[1] & 0x40)	/* FC.Protected */
+					atomic_inc(&dev->rx_data_protected);
+				if (rxinfo & (MT_RXINFO_ICVERR | MT_RXINFO_MICERR))
+					atomic_inc(&dev->rx_mic_err);
+				if (hw_dec &&
+				    atomic_inc_return(&dev->rx_data_decrypt_ok) == 1)
+					dev_info(dev->dev,
+						 "hwcrypto: first HW-decrypted RX data frame (RXINFO.DECRYPT set, MIC OK) -- chip decrypt path live\n");
+			}
+
+			if (!rf_2a4m1_rx_to_netdev(dev, info.data, flen, hw_dec))
+				rf_2a4m1_hal_deliver_rx(&dev->hal, &info);
+		}
 	}
 }
 
@@ -1926,6 +1994,160 @@ void rf_2a4m1_usb_rx_stop(struct rf_2a4m1_dev *dev)
 }
 
 /* --- ops --- */
+
+/*
+ * Program the MT7601U HW crypto key table from the completed 4-way's derived
+ * keys, so the chip does the CCMP data plane in hardware (native offload) rather
+ * than the software route.  Mirrors the mainline mt7601u key setup:
+ *   - pairwise TK -> per-WCID key table (MT_WCID_ADDR/KEY/IV/ATTR at slot
+ *     RF_2A4M1_HW_WCID): the chip HW-encrypts a TX frame whose TXWI.wcid == slot
+ *     (WIV=0) and HW-decrypts a Protected RX frame whose TA matches the CAM;
+ *   - group GTK   -> shared key table (MT_SKEY / MT_SKEY_MODE, BSS 0, key ids
+ *     1 + 2): the RX engine decrypts group-addressed frames indexed by the KeyID
+ *     in the received CCMP header, so program both candidate CCMP group ids;
+ *   - BSSID       -> MT_MAC_BSSID (the MYBSS filter the RX crypto engine needs
+ *     before it will look up the key and set RXINFO.DECRYPT).
+ * The keys are read from the in-driver SME (dev->sme), which runs the 4-way
+ * itself -- there is no wpa_supplicant add_key on this FullMAC path, so the glue
+ * installs them here, at connect completion (process context: reg writes sleep).
+ */
+int rf_2a4m1_usb_install_hw_keys(struct rf_2a4m1_dev *dev)
+{
+	const u8 idx = RF_2A4M1_HW_WCID;
+	const u8 *bssid = dev->sme.peer.a;
+	const u8 *tk = dev->sme.installed_tk;
+	const u8 *gtk = dev->sme.gtk;
+	u32 attr;
+	int i, gid;
+
+	if (!dev->hw_inited)
+		return -ENODEV;
+	if (!dev->sme.ptk_installed || !dev->sme.data_key_valid)
+		return -EINVAL;
+
+	/* Pairwise TK -> WCID key slot (unicast HW CCMP TX + RX). */
+	rf_2a4m1_reg_write(dev, MT_WCID_ADDR(idx), get_unaligned_le32(bssid));
+	rf_2a4m1_reg_write(dev, MT_WCID_ADDR(idx) + 4,
+			   (u32)bssid[4] | ((u32)bssid[5] << 8));
+	for (i = 0; i < 4; i++)			/* 16-B TK in the low half ... */
+		rf_2a4m1_reg_write(dev, MT_WCID_KEY(idx) + i * 4,
+				   get_unaligned_le32(tk + i * 4));
+	for (i = 4; i < 8; i++)			/* ... high half zeroed */
+		rf_2a4m1_reg_write(dev, MT_WCID_KEY(idx) + i * 4, 0);
+	rf_2a4m1_reg_write(dev, MT_WCID_IV(idx), 0x20000001u);	/* ExtIV, KeyID 0 */
+	rf_2a4m1_reg_write(dev, MT_WCID_IV(idx) + 4, 0);
+	attr = MT_WCID_ATTR_PAIRWISE |
+	       ((u32)(MT_CIPHER_AES_CCMP & 7) << MT_WCID_ATTR_PKEY_MODE_SHIFT);
+	rf_2a4m1_reg_write(dev, MT_WCID_ATTR(idx), attr);
+	rf_2a4m1_reg_rmw(dev, MT_WCID_DROP(idx), MT_WCID_DROP_MASK(idx), 0);
+
+	/* Group GTK -> shared key table, BSS 0, both candidate CCMP key ids. */
+	for (gid = 1; gid <= 2; gid++) {
+		u32 mode;
+
+		for (i = 0; i < 4; i++)
+			rf_2a4m1_reg_write(dev, MT_SKEY(0, gid) + i * 4,
+					   get_unaligned_le32(gtk + i * 4));
+		for (i = 4; i < 8; i++)
+			rf_2a4m1_reg_write(dev, MT_SKEY(0, gid) + i * 4, 0);
+		mode = rf_2a4m1_reg_read(dev, MT_SKEY_MODE_0(0));
+		mode &= ~(MT_SKEY_MODE_MASK << MT_SKEY_MODE_SHIFT(0, gid));
+		mode |= (u32)MT_CIPHER_AES_CCMP << MT_SKEY_MODE_SHIFT(0, gid);
+		rf_2a4m1_reg_write(dev, MT_SKEY_MODE_0(0), mode);
+	}
+
+	/* BSSID -> MYBSS filter (the RX crypto engine's gate). */
+	rf_2a4m1_reg_write(dev, MT_MAC_BSSID_DW0, get_unaligned_le32(bssid));
+	rf_2a4m1_reg_write(dev, MT_MAC_BSSID_DW1,
+			   (u32)bssid[4] | ((u32)bssid[5] << 8));
+
+	ether_addr_copy(dev->hw_peer, bssid);
+	dev->hw_wcid = idx;
+	dev->hw_key_installed = true;
+
+	dev_info(dev->dev,
+		 "hwcrypto: CCMP key table programmed - WCID %u peer %pM attr=0x%08x (rb 0x%08x) key0=0x%08x skey_mode=0x%08x; chip HW-encrypts TX + HW-decrypts RX\n",
+		 idx, bssid, attr, rf_2a4m1_reg_read(dev, MT_WCID_ATTR(idx)),
+		 rf_2a4m1_reg_read(dev, MT_WCID_KEY(idx)),
+		 rf_2a4m1_reg_read(dev, MT_SKEY_MODE_0(0)));
+	return 0;
+}
+
+/*
+ * Transmit an 802.3 frame as an HW-CCMP-encrypted 802.11 Data frame.  Build the
+ * real 24-octet 802.11 Data header (toDS: A1=BSSID, A2=us, A3=DA) + the RFC1042
+ * LLC/SNAP shim, set FC.Protected, and hand the chip PLAINTEXT with TXWI.wcid =
+ * the pairwise key slot and DMA WIV=0 (op_tx derives WIV from key_slot != 0xff) --
+ * so the MT7601U CCMP engine inserts the CCMP header (its own PN counter) +
+ * encrypts + appends the 8-B MIC.  Atomic-context safe (GFP_ATOMIC + async
+ * bulk-out): ndo_start_xmit can run in softirq.  Returns 0 when queued.
+ */
+int rf_2a4m1_usb_hw_data_tx(struct rf_2a4m1_dev *dev, const u8 *eth,
+			    unsigned int eth_len)
+{
+	struct rf_2a4m1_mpdu m;
+	struct rf_2a4m1_tx_params tp;
+	const u8 *da, *payload;
+	unsigned int plen, o;
+	u16 ethertype, sc;
+	u8 *frame;
+	int ret;
+
+	if (!dev->hw_inited || !dev->hw_key_installed)
+		return -ENODEV;
+	if (eth_len < ETH_HLEN)
+		return -EINVAL;
+	plen = eth_len - ETH_HLEN;
+	/* 24 hdr + 8 LLC/SNAP + payload + TXWI + DMA framing under the ATOMIC buf. */
+	if (24 + 8 + plen + RF_2A4M1_MT7601U_TXWI_SIZE + 8 > RF_2A4M1_TX_BUF_SZ)
+		return -EMSGSIZE;
+
+	da        = eth;			/* 802.3 dest -> A3 (DA) */
+	ethertype = ((u16)eth[12] << 8) | eth[13];
+	payload   = eth + ETH_HLEN;
+
+	frame = kmalloc(24 + 8 + plen, GFP_ATOMIC);
+	if (!frame)
+		return -ENOMEM;
+
+	frame[0] = 0x08;			/* Type=Data(2), subtype 0 */
+	frame[1] = 0x01 | 0x40;			/* toDS + Protected */
+	frame[2] = 0; frame[3] = 0;		/* Duration -- HW fills it */
+	ether_addr_copy(frame + 4,  dev->hw_peer);	/* A1 = RA = BSSID */
+	ether_addr_copy(frame + 10, dev->macaddr.a);	/* A2 = TA = us    */
+	ether_addr_copy(frame + 16, da);		/* A3 = DA         */
+	sc = (u16)(dev->data_seq++ << 4);		/* seqno << 4, frag 0 */
+	put_unaligned_le16(sc, frame + 22);
+	o = 24;
+	frame[o++] = 0xaa; frame[o++] = 0xaa; frame[o++] = 0x03;	/* LLC/SNAP */
+	frame[o++] = 0x00; frame[o++] = 0x00; frame[o++] = 0x00;
+	frame[o++] = (u8)(ethertype >> 8);
+	frame[o++] = (u8)(ethertype & 0xff);
+	if (plen)
+		memcpy(frame + o, payload, plen);
+	o += plen;
+
+	memset(&tp, 0, sizeof(tp));
+	tp.wcid     = dev->hw_wcid;	/* TXWI.wcid = pairwise slot */
+	tp.key_slot = dev->hw_wcid;	/* != 0xff => WIV=0 => chip encrypts */
+	tp.ac       = 1;		/* AC_BE */
+	tp.gen      = RF_2A4M1_HAL_GEN_LEGACY;
+	tp.phy_mode = RF_2A4M1_HAL_PHY_OFDM;	/* OFDM 6 Mbps -- robust */
+	tp.bw_mhz   = 20;
+	tp.n_ss     = 1;
+
+	m.data = frame;
+	m.len  = (u16)o;
+	m.cap  = (u16)o;
+	/* op_tx copies @frame into its own DMA buffer, so free @frame after. */
+	ret = dev->hal.ops->tx(&dev->hal, &m, &tp);
+	kfree(frame);
+	if (!ret && atomic_inc_return(&dev->tx_data_ccmp) == 1)
+		dev_info(dev->dev,
+			 "hwcrypto: first HW-CCMP data frame TX'd (%u B plaintext MPDU, FC.Protected=1, wcid=%u, WIV=0 -> chip encrypts)\n",
+			 (unsigned int)o, dev->hw_wcid);
+	return ret;
+}
 
 static int rf_2a4m1_op_start(struct rf_2a4m1_hal *h,
 			     const struct rf_2a4m1_hal_cfg *cfg)
@@ -2023,16 +2245,21 @@ static int rf_2a4m1_op_set_key(struct rf_2a4m1_hal *h, u8 slot,
 {
 	struct rf_2a4m1_dev *dev = h->priv;
 
-	(void)slot; (void)k;
+	(void)slot;
 	/*
-	 * TODO: program the MT7601U per-WCID HW crypto key table
-	 * (MT_WCID_KEY/IV/ATTR + the address CAM) so the chip auto-encrypts/
-	 * decrypts.  Until the chip-init path lands, keys are handled by the
-	 * core's software crypto (WIV path).  Kept as a real, wired op so the
-	 * cfg80211 .add_key -> hal->ops->set_key downward face is exercised.
+	 * The MT7601U per-WCID HW crypto key table is programmed by
+	 * rf_2a4m1_usb_install_hw_keys() at connect completion, from the keys the
+	 * in-driver SME derived in its own 4-way (this FullMAC driver runs the
+	 * handshake itself, so there is no wpa_supplicant .add_key here).  This op
+	 * stays wired for the external-supplicant path (cfg80211 .add_key ->
+	 * set_key): a pairwise CCMP key with a peer triggers the same HW install.
 	 */
-	dev_dbg(dev->dev, "set_key slot %u (cipher %u) - sw-crypto path\n",
-		slot, k ? k->cipher : 0);
+	if (k && k->type == 1 && k->cipher == MT_CIPHER_AES_CCMP &&
+	    dev->sme.ptk_installed)
+		rf_2a4m1_usb_install_hw_keys(dev);
+	else
+		dev_dbg(dev->dev, "set_key slot %u (cipher %u) - deferred to connect completion\n",
+			slot, k ? k->cipher : 0);
 	return 0;
 }
 

@@ -176,16 +176,23 @@ static netdev_tx_t rf_2a4m1_ndo_start_xmit(struct sk_buff *skb,
 					   struct net_device *ndev)
 {
 	struct rf_2a4m1_dev *dev = rf_2a4m1_from_ndev(ndev);
+	int ret;
 
 	/*
-	 * The core's SME shapes the 802.3 payload into an 802.11 data frame
-	 * (encap + QoS + crypto) and hands it to the HAL.  TODO: the
-	 * 802.3<->802.11 datapath (multi-skb, TX-status completion, flow
-	 * control) is a first-frame wiring here, not a full datapath.
+	 * Encapsulate the 802.3 frame as an HW-CCMP-encrypted 802.11 Data frame
+	 * and DMA it out on AC_BE: the chip inserts the CCMP header + encrypts +
+	 * appends the MIC (native offload, wcid = the pairwise key slot, WIV=0).
+	 * Each skb is an independent async bulk-out URB anchored for teardown, so
+	 * multiple frames pipeline; the queue is never stopped, so the stack is
+	 * free to hand us the next skb immediately.
 	 */
-	rf_2a4m1_sme_data_tx(&dev->sme, skb->data, skb->len);
-	ndev->stats.tx_packets++;
-	ndev->stats.tx_bytes += skb->len;
+	ret = rf_2a4m1_usb_hw_data_tx(dev, skb->data, skb->len);
+	if (!ret) {
+		ndev->stats.tx_packets++;
+		ndev->stats.tx_bytes += skb->len;
+	} else {
+		ndev->stats.tx_dropped++;
+	}
 	dev_kfree_skb(skb);
 	return NETDEV_TX_OK;
 }
@@ -312,6 +319,16 @@ static void rf_2a4m1_connect_worker(struct work_struct *w)
 		struct cfg80211_bss *bss;
 
 		dev->connect_pending = false;
+		/*
+		 * The 4-way is done and the SME derived the PTK/GTK.  Program the
+		 * MT7601U HW crypto key table from those keys (pairwise TK + GTK +
+		 * BSSID) so the data plane is HW-encrypted/decrypted -- the SME ran
+		 * the handshake itself, so this is the equivalent of the
+		 * add_key/install a wpa_supplicant path would drive.  Process
+		 * context (delayed work), so the register writes may sleep.
+		 */
+		if (!dev->hw_key_installed)
+			rf_2a4m1_usb_install_hw_keys(dev);
 		/*
 		 * Publish the AP's BSS to cfg80211 BEFORE reporting success and
 		 * pass the referenced bss straight into cfg80211_connect_bss(),
@@ -563,6 +580,19 @@ static int rf_2a4m1_cfg_disconnect(struct wiphy *wiphy, struct net_device *ndev,
 
 	dev->connect_pending = false;
 	cancel_delayed_work(&dev->connect_work);
+	/*
+	 * The encrypted-data-plane tally: tx_ccmp = frames HW-encrypted + radiated,
+	 * rx_protected = Protected data frames received, rx_decrypt_ok =
+	 * HW-decrypted-OK (RXINFO.DECRYPT), rx_mic_err = ICV/MIC decrypt failures.
+	 * decrypt_ok > 0 proves the RX traffic was HW-decrypted, not software CCMP.
+	 */
+	dev_info(dev->dev,
+		 "hwcrypto counters at disconnect: tx_ccmp=%d rx_protected=%d rx_decrypt_ok=%d rx_mic_err=%d\n",
+		 atomic_read(&dev->tx_data_ccmp),
+		 atomic_read(&dev->rx_data_protected),
+		 atomic_read(&dev->rx_data_decrypt_ok),
+		 atomic_read(&dev->rx_mic_err));
+	dev->hw_key_installed = false;
 	rf_2a4m1_sme_tx_protected_deauth(&dev->sme, reason_code);
 	cfg80211_disconnected(ndev, reason_code, NULL, 0, true, GFP_KERNEL);
 	return 0;
