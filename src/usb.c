@@ -2017,6 +2017,16 @@ static void rf_2a4m1_rx_process_seg(struct rf_2a4m1_dev *dev,
 					spin_unlock(&dev->bss_frame_lock);
 				}
 				/*
+				 * Scan harvest: while a scan is dwelling on this
+				 * channel, publish EVERY beacon / probe-response
+				 * to cfg80211's BSS table (not just the connect
+				 * target) -- this is what feeds `iw scan` and
+				 * SSID-driven connect.  A no-op when no scan runs.
+				 */
+				if (sub == 8 || sub == 5)
+					rf_2a4m1_scan_rx_bss(dev, info.data,
+							     flen, info.rssi);
+				/*
 				 * Beacon / probe-response detail, incl. RSSI --
 				 * dev_dbg, not dev_info: in a busy 2.4 GHz cell
 				 * this fires many times per second. Enable via
@@ -2130,6 +2140,32 @@ void rf_2a4m1_usb_rx_stop(struct rf_2a4m1_dev *dev)
 	cancel_work_sync(&dev->rx_work);
 	usb_kill_anchored_urbs(&dev->tx_anchor);
 	skb_queue_purge(&dev->rx_queue);
+	dev->rx_running = false;
+}
+
+/*
+ * Idempotent RX bring-up.  Enable the MAC RX/TX engine (if the chip came up) +
+ * start the TX-status drain + arm the bulk-IN ring -- but only once.  A scan
+ * needs RX live before any connect starts it (a standalone `iw scan` before an
+ * association must still hear beacons), and a later connect-time hal_start then
+ * finds the ring already up and no-ops it here.  rf_2a4m1_usb_rx_start() is NOT
+ * idempotent (it re-kmallocs + re-submits every URB), so the rx_running guard is
+ * what makes a second caller safe.
+ */
+int rf_2a4m1_usb_rx_ensure(struct rf_2a4m1_dev *dev)
+{
+	int ret;
+
+	if (dev->rx_running)
+		return 0;
+	if (dev->hw_inited)
+		rf_2a4m1_mac_start_rx(dev);
+	rf_2a4m1_usb_stat_start(dev);
+	ret = rf_2a4m1_usb_rx_start(dev);
+	if (ret)
+		return ret;
+	dev->rx_running = true;
+	return 0;
 }
 
 /* --- ops --- */
@@ -2500,17 +2536,15 @@ static int rf_2a4m1_op_start(struct rf_2a4m1_hal *h,
 	(void)cfg;
 	/*
 	 * The MAC/BBP/RF register init + calibration + channel program run once
-	 * at probe (rf_2a4m1_chip_init).  Here we enable the MAC RX/TX engine
-	 * (only if the chip actually came up) and arm the bulk-IN RX ring, so
-	 * received frames flow up through the descriptor path into the core.
+	 * at probe (rf_2a4m1_chip_init).  Enable the MAC RX/TX engine (only if the
+	 * chip actually came up), start draining the TX-status FIFO (so cleartext
+	 * connect/EAPOL ACKs are captured alongside the later encrypted data-frame
+	 * ACKs), and arm the bulk-IN RX ring -- all idempotent, so a scan that
+	 * already brought RX up before this connect-time hal_start is a no-op here.
+	 * The core's inline hal_start has already registered the SME rx_cb, so
+	 * connect's RX delivery stays wired regardless.
 	 */
-	if (dev->hw_inited)
-		rf_2a4m1_mac_start_rx(dev);
-	/* Start draining the TX-status FIFO now, before the connect frames go
-	 * out, so cleartext connect/EAPOL ACKs are captured alongside the later
-	 * encrypted data-frame ACKs. */
-	rf_2a4m1_usb_stat_start(dev);
-	return rf_2a4m1_usb_rx_start(dev);
+	return rf_2a4m1_usb_rx_ensure(dev);
 }
 
 static void rf_2a4m1_op_stop(struct rf_2a4m1_hal *h)

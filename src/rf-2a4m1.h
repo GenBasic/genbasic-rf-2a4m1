@@ -56,6 +56,23 @@
  */
 #define RF_2A4M1_CONNECT_MAX_POLLS	200
 
+/*
+ * Scan (.scan) channel-hop dwell.  120 ms outlasts a 100-TU (~102 ms) beacon
+ * interval, so every channel yields at least one beacon from each AP camped on
+ * it (a shorter dwell can silently miss an AP whose beacon we just missed).
+ */
+#define RF_2A4M1_SCAN_DWELL_MS	120
+/*
+ * Probe-request scratch bound: 802.11 hdr(24) + SSID(2+32) + supported-rates
+ * (2+8) + the scan request's extra IEs.  The extra-IE span is capped at
+ * RF_2A4M1_SCAN_IE_MAX (also advertised as wiphy->max_scan_ie_len) so the whole
+ * probe MPDU -- once wrapped with the TXWI + DMA framing -- stays well under
+ * RF_2A4M1_TX_BUF_SZ.
+ */
+#define RF_2A4M1_SCAN_IE_MAX	512
+#define RF_2A4M1_SCAN_PROBE_MAX	(24 + 2 + IEEE80211_MAX_SSID_LEN + 2 + 8 + \
+				 RF_2A4M1_SCAN_IE_MAX)
+
 /* RX URB ring depth (bulk-IN pipeline). */
 #define RF_2A4M1_RX_URBS	4
 /*
@@ -177,6 +194,30 @@ struct rf_2a4m1_dev {
 	u8			connect_ssid[IEEE80211_MAX_SSID_LEN];
 	u8			connect_ssid_len;
 	struct ieee80211_channel *connect_chan;
+
+	/*
+	 * Scan (cfg80211 .scan): a glue-driven channel-hop sweep TXes
+	 * probe-requests and harvests beacons / probe-responses into cfg80211's
+	 * BSS table, so userspace (wpa_supplicant / NetworkManager) can drive the
+	 * radio by SSID -- not only by a handed BSSID.  scan_lock guards scan_req +
+	 * scan_cur_freq: the RX worker reads scan_cur_freq to attribute a harvested
+	 * BSS to the channel the sweep is dwelling on, while the scan worker writes
+	 * both -- two work items that can run on different CPUs.
+	 */
+	struct delayed_work	scan_work;
+	spinlock_t		scan_lock;
+	struct cfg80211_scan_request *scan_req;	/* non-NULL while a scan runs */
+	unsigned int		scan_chan_idx;	/* next channel in scan_req->channels */
+	u16			scan_cur_freq;	/* MHz the sweep dwells on (0 = idle) */
+	bool			scan_aborted;	/* teardown asked the sweep to stop */
+
+	/*
+	 * RX-ring liveness.  The bulk-IN ring + MAC RX are armed once -- by a scan
+	 * or a connect, whichever comes first (a standalone `iw scan` before any
+	 * connect must still hear beacons) -- and torn down at unload.  Guards
+	 * rf_2a4m1_usb_rx_start() against a double-arm (it is not idempotent).
+	 */
+	bool			rx_running;
 
 	/*
 	 * Latest beacon / probe-response overheard FROM the connect target, so
@@ -329,6 +370,13 @@ int rf_2a4m1_usb_load_firmware(struct rf_2a4m1_dev *dev,
 void rf_2a4m1_usb_hal_init(struct rf_2a4m1_dev *dev);
 int rf_2a4m1_usb_rx_start(struct rf_2a4m1_dev *dev);
 void rf_2a4m1_usb_rx_stop(struct rf_2a4m1_dev *dev);
+/*
+ * Idempotent RX bring-up: enable MAC RX + arm the bulk-IN ring iff not already
+ * running.  A scan needs RX live before any connect has started it; a later
+ * connect-time start then no-ops the ring (the SME rx_cb is still registered by
+ * the core's hal_start, so connect's RX delivery stays wired).
+ */
+int rf_2a4m1_usb_rx_ensure(struct rf_2a4m1_dev *dev);
 
 /* Program the MT7601U HW crypto key table (pairwise TK + GTK + BSSID) from the
  * completed 4-way's derived keys in dev->sme, so the chip does CCMP TX/RX. */
@@ -359,5 +407,12 @@ int rf_2a4m1_reg_write(struct rf_2a4m1_dev *dev, u16 offset, u32 val);
 int rf_2a4m1_cfg80211_register(struct rf_2a4m1_dev *dev);
 void rf_2a4m1_cfg80211_unregister(struct rf_2a4m1_dev *dev);
 struct wiphy *rf_2a4m1_wiphy_alloc(struct device *dev);
+/*
+ * Scan-mode RX harvest: while a scan dwells on a channel, publish a received
+ * beacon / probe-response to cfg80211's BSS table.  Called from the USB HAL's
+ * RX worker (process context); a no-op when no scan is active.
+ */
+void rf_2a4m1_scan_rx_bss(struct rf_2a4m1_dev *dev, const u8 *frame, u16 len,
+			  s8 rssi);
 
 #endif /* RF_2A4M1_H */
