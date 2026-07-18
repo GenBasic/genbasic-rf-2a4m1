@@ -326,6 +326,28 @@ struct rf_2a4m1_dev {
 	atomic_t		txs_logged;		/* bounds the per-report log */
 	atomic_t		bogus_probe_done;	/* one-shot bogus-BSSID probe */
 	atomic_t		rx_dhcp_reply;		/* inbound DHCP OFFER/ACK frames */
+
+	/*
+	 * Link statistics for cfg80211 .get_station (`iw dev <if> station dump`).
+	 * The peer of a managed-STA link is the AP, so every frame whose
+	 * transmitter address (addr2) is the connected BSSID carries a fresh
+	 * signal reading in its RXWI -- stash it here for get_station to report.
+	 * The RXWI rate (RX) + the MAC TX-status FIFO rate (TX) give the real
+	 * negotiated bitrates.  Written by the RX worker + the TX-status drain
+	 * (both process context, and either can run on a different CPU than the
+	 * get_station caller), read under link_lock.
+	 */
+	spinlock_t		link_lock;
+	bool			peer_rssi_valid;	/* seen >=1 frame from the AP */
+	s8			peer_rssi;		/* last RXWI RSSI from the AP, dBm */
+	bool			peer_rxrate_valid;	/* captured a DATA-frame RX rate */
+	u16			peer_rx_mcs;		/* raw RXWI MCS field */
+	u8			peer_rx_phy_mode;	/* HAL_PHY_CCK / OFDM / HT */
+	u16			peer_rx_bw_mhz;		/* 20 or 40 */
+	bool			peer_rx_sgi;		/* short guard interval */
+	bool			peer_txrate_valid;	/* drained a data TX-status report */
+	u16			peer_tx_rate_word;	/* last MT_RATE word, data class */
+	unsigned long		connected_jiffies;	/* set when the 4-way completes */
 };
 
 /*

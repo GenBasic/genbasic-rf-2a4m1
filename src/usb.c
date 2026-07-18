@@ -1884,6 +1884,39 @@ static void rf_2a4m1_rx_process_seg(struct rf_2a4m1_dev *dev,
 		atomic_inc(&dev->rx_frames);
 
 		/*
+		 * Link-signal / rate capture for get_station.  addr2 (offset 10)
+		 * is the transmitter: for any frame the AP sends us it equals the
+		 * BSSID we connected to, so a match means "this frame came from our
+		 * AP".  Record its RXWI RSSI on EVERY such frame (a fresh signal),
+		 * and the RX data-rate on DATA frames only -- a beacon rides the
+		 * basic rate, which is not the negotiated link rate `iw` should
+		 * report.
+		 */
+		if (flen >= 16 && is_valid_ether_addr(dev->connect_bssid) &&
+		    ether_addr_equal(info.data + 10, dev->connect_bssid)) {
+			u16 fc0 = (u16)(info.data[0] | ((u16)info.data[1] << 8));
+
+			spin_lock(&dev->link_lock);
+			dev->peer_rssi = info.rssi;
+			dev->peer_rssi_valid = true;
+			/*
+			 * Capture the RX rate only from a UNICAST DATA frame the AP
+			 * sent to us (addr1 == our MAC).  A broadcast/multicast data
+			 * frame rides the basic rate (1 Mbps CCK), which is not the
+			 * rate-controlled unicast link rate `iw` should report.
+			 */
+			if (((fc0 >> 2) & 3) == 2 &&
+			    ether_addr_equal(info.data + 4, dev->macaddr.a)) {
+				dev->peer_rx_mcs      = info.mcs;
+				dev->peer_rx_phy_mode = info.phy_mode;
+				dev->peer_rx_bw_mhz   = info.bw_mhz;
+				dev->peer_rx_sgi      = info.short_gi;
+				dev->peer_rxrate_valid = true;
+			}
+			spin_unlock(&dev->link_lock);
+		}
+
+		/*
 		 * EAPOL-Key (the 4-way) rides a DATA frame behind LLC/SNAP, so
 		 * count it here where every frame passes -- the mgmt histogram
 		 * cannot see it, and "no M1 arrived" vs "M1 arrived and was
@@ -2401,6 +2434,21 @@ static void rf_2a4m1_drain_tx_status(struct rf_2a4m1_dev *dev)
 			atomic_inc(&dev->txs_success[pid]);
 		if (ackreq)
 			atomic_inc(&dev->txs_ackreq[pid]);
+
+		/*
+		 * The report's rate word (MT_RATE format: PHY type + MCS + BW +
+		 * SGI) is the rate the MAC actually radiated this frame at.  Stash
+		 * the encrypted-data class (frames to the AP) so get_station can
+		 * report a real TX bitrate; the cleartext/bogus classes are connect
+		 * frames, not the steady-state link rate.
+		 */
+		if (pid == RF_2A4M1_PID_ENCRYPTED) {
+			spin_lock(&dev->link_lock);
+			dev->peer_tx_rate_word =
+				(u16)((fifo >> MT_TXS_FIFO_RATE_SHIFT) & 0xffff);
+			dev->peer_txrate_valid = true;
+			spin_unlock(&dev->link_lock);
+		}
 
 		/* Verbatim per-report line, bounded. pid: 1=CLEARTEXT(WIV=1)
 		 * 2=ENCRYPTED(WIV=0 to AP) 3=BOGUS(WIV=0 to bogus BSSID). */

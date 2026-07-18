@@ -319,6 +319,8 @@ static void rf_2a4m1_connect_worker(struct work_struct *w)
 		struct cfg80211_bss *bss;
 
 		dev->connect_pending = false;
+		if (!dev->connected_jiffies)
+			dev->connected_jiffies = jiffies;
 		/*
 		 * The 4-way is done and the SME derived the PTK/GTK.  Program the
 		 * MT7601U HW crypto key table from those keys (pairwise TK + GTK +
@@ -426,6 +428,32 @@ static void rf_2a4m1_connect_worker(struct work_struct *w)
 			 atomic_read(&dev->rx_urb_last_err),
 			 atomic_read(&dev->rx_urbs), atomic_read(&dev->rx_frames),
 			 RF_2A4M1_RX_URBS, RF_2A4M1_RX_BUF_SZ);
+		/*
+		 * The intermittent-stall smoking gun.  sme.state can only return to
+		 * SME_INIT mid-connect through the core's Deauth/Disassoc handler, so
+		 * a nonzero sme.mgmt_prot_honored means a RECEIVED Deauth/Disassoc
+		 * reset the connecting SME to INIT -- after which every target
+		 * probe-response is ignored (the SCANNING->auth step is gated on
+		 * SME_INIT != state) and the connect stalls with auth=0.  Pair it
+		 * with the disassoc(10)/deauth(12) RX counts, which the subtype
+		 * histogram above omits, to see which frame did it.
+		 */
+		dev_info(dev->dev,
+			 "connect: mgmt-reset probe: disassoc_rx=%d deauth_rx=%d sme.mgmt_prot_honored=%u sme.mgmt_unprot_dropped=%u (honored>0 => a stray Deauth/Disassoc reset the SME to INIT mid-connect)\n",
+			 atomic_read(&dev->rx_mgmt_sub[10]),
+			 atomic_read(&dev->rx_mgmt_sub[12]),
+			 dev->sme.mgmt_prot_honored, dev->sme.mgmt_unprot_dropped);
+		/*
+		 * Drain the MAC TX-status FIFO once and print the CLEARTEXT
+		 * (connect-mgmt, pktid 1) ACK summary: this is what separates "our
+		 * auth/assoc frames were radiated + ACK'd by the AP (success>0) but
+		 * it never answered" from "they were never ACK'd (success=0), so the
+		 * AP never saw them" -- the auth/assoc-TX-radiating candidate.  Only
+		 * pktid-stamped frames post a report, so the 16-deep FIFO holds the
+		 * handful of connect frames undrained until now (no periodic drain
+		 * runs during connect, so this does not perturb the exchange).
+		 */
+		rf_2a4m1_usb_stat_report(dev);
 		cfg80211_connect_timeout(dev->ndev, dev->connect_bssid, NULL, 0,
 					 GFP_KERNEL, NL80211_TIMEOUT_UNSPECIFIED);
 		return;
@@ -855,6 +883,15 @@ static int rf_2a4m1_cfg_connect(struct wiphy *wiphy, struct net_device *ndev,
 	dev->bss_frame_rssi = -60;	/* placeholder until a target beacon is heard */
 	spin_unlock(&dev->bss_frame_lock);
 
+	/* Start the link stats fresh: last connect's signal/rate must not leak
+	 * into this one's get_station before a single frame has been heard. */
+	spin_lock(&dev->link_lock);
+	dev->peer_rssi_valid = false;
+	dev->peer_rxrate_valid = false;
+	dev->peer_txrate_valid = false;
+	spin_unlock(&dev->link_lock);
+	dev->connected_jiffies = 0;
+
 	dev->connect_pending = true;
 	schedule_delayed_work(&dev->connect_work,
 			      msecs_to_jiffies(RF_2A4M1_CONNECT_POLL_MS));
@@ -959,13 +996,157 @@ static int rf_2a4m1_cfg_change_iface(struct wiphy *wiphy,
 	return 0;
 }
 
+/*
+ * Fill a cfg80211 rate_info from the MT7601U's per-frame PHY / MCS / BW / SGI.
+ * For an HT frame cfg80211 computes the bitrate from the MCS itself; for a
+ * legacy frame the RXWI/TX-status carries a hardware rate index, mapped here to
+ * the 802.11b/g rate (units of 100 kbps) exactly as the mainline mt7601u driver
+ * decodes it (mt76_mac_process_rate).  1T1R silicon, so a single spatial stream.
+ */
+static void rf_2a4m1_fill_rate(struct rate_info *ri, u8 hal_phy, u16 mcs,
+			       u16 bw_mhz, bool sgi)
+{
+	/* mt76 rate-index -> rate*100kbps for the 2.4 GHz legacy tables. */
+	static const u16 ofdm_rate[8] = { 60, 90, 120, 180, 240, 360, 480, 540 };
+	static const u16 cck_rate[4]  = { 10, 20, 55, 110 };
+
+	memset(ri, 0, sizeof(*ri));
+
+	switch (hal_phy) {
+	case RF_2A4M1_HAL_PHY_HT:
+		ri->flags = RATE_INFO_FLAGS_MCS;
+		ri->mcs   = (u8)(mcs & 0x7);	/* 1T1R MT7601U: MCS 0..7 */
+		ri->bw    = (bw_mhz == 40) ? RATE_INFO_BW_40 : RATE_INFO_BW_20;
+		if (sgi)
+			ri->flags |= RATE_INFO_FLAGS_SHORT_GI;
+		break;
+	case RF_2A4M1_HAL_PHY_OFDM:
+		ri->bw     = RATE_INFO_BW_20;
+		ri->legacy = ofdm_rate[mcs & 0x7];
+		break;
+	case RF_2A4M1_HAL_PHY_CCK:
+	default: {
+		u16 idx = mcs;
+
+		if (idx >= 8)		/* high bit flags short preamble */
+			idx -= 8;
+		if (idx >= 4)
+			idx = 0;
+		ri->bw     = RATE_INFO_BW_20;
+		ri->legacy = cck_rate[idx];
+		break;
+	}
+	}
+}
+
+/*
+ * Populate a station_info for the connected AP from what the RX path + the
+ * TX-status FIFO actually measured this link.  Sets the `filled` mask bit for a
+ * field ONLY when a real value backs it -- an unpopulated field stays 0 with its
+ * bit clear (no fabricated signal / rate).
+ */
+static void rf_2a4m1_fill_station(struct rf_2a4m1_dev *dev,
+				  struct station_info *sinfo)
+{
+	bool rssi_valid, rxrate_valid, txrate_valid;
+	u16 rx_mcs, rx_bw, tx_word;
+	u8 rx_phy;
+	bool rx_sgi;
+	s8 rssi;
+
+	sinfo->filled = 0;
+
+	/* netdev already counts the bridged data plane -- report it verbatim. */
+	sinfo->tx_bytes   = dev->ndev->stats.tx_bytes;
+	sinfo->rx_bytes   = dev->ndev->stats.rx_bytes;
+	sinfo->tx_packets = dev->ndev->stats.tx_packets;
+	sinfo->rx_packets = dev->ndev->stats.rx_packets;
+	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_BYTES64) |
+			 BIT_ULL(NL80211_STA_INFO_RX_BYTES64) |
+			 BIT_ULL(NL80211_STA_INFO_TX_PACKETS) |
+			 BIT_ULL(NL80211_STA_INFO_RX_PACKETS);
+
+	if (dev->connected_jiffies) {
+		sinfo->connected_time =
+			(u32)((jiffies - dev->connected_jiffies) / HZ);
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_CONNECTED_TIME);
+	}
+
+	spin_lock_bh(&dev->link_lock);
+	rssi_valid   = dev->peer_rssi_valid;
+	rssi         = dev->peer_rssi;
+	rxrate_valid = dev->peer_rxrate_valid;
+	rx_mcs       = dev->peer_rx_mcs;
+	rx_phy       = dev->peer_rx_phy_mode;
+	rx_bw        = dev->peer_rx_bw_mhz;
+	rx_sgi       = dev->peer_rx_sgi;
+	txrate_valid = dev->peer_txrate_valid;
+	tx_word      = dev->peer_tx_rate_word;
+	spin_unlock_bh(&dev->link_lock);
+
+	if (rssi_valid) {
+		sinfo->signal = rssi;
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL);
+	}
+
+	if (rxrate_valid) {
+		rf_2a4m1_fill_rate(&sinfo->rxrate, rx_phy, rx_mcs, rx_bw, rx_sgi);
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_BITRATE);
+	}
+
+	if (txrate_valid) {
+		u8 mtphy = (tx_word & RF_2A4M1_MT_RATE_PHY_MASK) >>
+			   RF_2A4M1_MT_RATE_PHY_SHIFT;
+		u8 hal_phy = (mtphy == RF_2A4M1_MT_PHY_TYPE_CCK)  ? RF_2A4M1_HAL_PHY_CCK :
+			     (mtphy == RF_2A4M1_MT_PHY_TYPE_OFDM) ? RF_2A4M1_HAL_PHY_OFDM :
+								    RF_2A4M1_HAL_PHY_HT;
+
+		rf_2a4m1_fill_rate(&sinfo->txrate, hal_phy,
+				   tx_word & RF_2A4M1_MT_RATE_MCS_MASK,
+				   (tx_word & RF_2A4M1_MT_RATE_BW_40) ? 40 : 20,
+				   (tx_word & RF_2A4M1_MT_RATE_SGI) != 0);
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_BITRATE);
+	}
+}
+
+/* True once the managed-STA link to the AP is up (a peer exists to report). */
+static bool rf_2a4m1_link_up(struct rf_2a4m1_dev *dev)
+{
+	return dev->sme.state == RF_2A4M1_SME_CONNECTED || dev->sme.connected;
+}
+
 static int rf_2a4m1_cfg_get_station(struct wiphy *wiphy,
 				    struct net_device *ndev,
 				    const u8 *mac,
 				    struct station_info *sinfo)
 {
-	/* TODO: fill rate/RSSI from the RXWI the core last saw. */
-	sinfo->filled = 0;
+	struct rf_2a4m1_dev *dev = rf_2a4m1_from_wiphy(wiphy);
+
+	/* The only station on a managed-STA interface is the AP. */
+	if (!rf_2a4m1_link_up(dev) ||
+	    !ether_addr_equal(mac, dev->connect_bssid))
+		return -ENOENT;
+
+	rf_2a4m1_fill_station(dev, sinfo);
+	return 0;
+}
+
+/*
+ * A cfg80211 FullMAC driver gets no mac80211 default, so `iw station dump` needs
+ * this op explicitly -- without it the dump returns EOPNOTSUPP.  A managed STA
+ * has exactly one station (the AP), reported at index 0.
+ */
+static int rf_2a4m1_cfg_dump_station(struct wiphy *wiphy,
+				     struct net_device *ndev, int idx,
+				     u8 *mac, struct station_info *sinfo)
+{
+	struct rf_2a4m1_dev *dev = rf_2a4m1_from_wiphy(wiphy);
+
+	if (idx != 0 || !rf_2a4m1_link_up(dev))
+		return -ENOENT;
+
+	ether_addr_copy(mac, dev->connect_bssid);
+	rf_2a4m1_fill_station(dev, sinfo);
 	return 0;
 }
 
@@ -978,6 +1159,7 @@ static const struct cfg80211_ops rf_2a4m1_cfg80211_ops = {
 	.set_default_key	= rf_2a4m1_cfg_set_default_key,
 	.change_virtual_intf	= rf_2a4m1_cfg_change_iface,
 	.get_station		= rf_2a4m1_cfg_get_station,
+	.dump_station		= rf_2a4m1_cfg_dump_station,
 };
 
 /* ================================================================== */
@@ -1029,6 +1211,7 @@ int rf_2a4m1_cfg80211_register(struct rf_2a4m1_dev *dev)
 
 	spin_lock_init(&dev->bss_frame_lock);
 	spin_lock_init(&dev->scan_lock);
+	spin_lock_init(&dev->link_lock);
 	INIT_DELAYED_WORK(&dev->connect_work, rf_2a4m1_connect_worker);
 	INIT_DELAYED_WORK(&dev->scan_work, rf_2a4m1_scan_worker);
 	rf_2a4m1_usb_stat_init(dev);
